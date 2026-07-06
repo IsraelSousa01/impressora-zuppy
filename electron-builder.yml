@@ -15,6 +15,11 @@ win:
       arch: [x64]
   icon: resources/icon.ico
   artifactName: ZuppyImpressora-${version}-Setup.exe
+  # Hook de assinatura de código. NO-OP enquanto não houver certificado
+  # (build sai sem assinatura, como hoje). Pra assinar: defina as env vars
+  # documentadas em scripts/sign.js. Pra usar o caminho CSC nativo em vez do
+  # hook, remova esta linha e use CSC_LINK/CSC_KEY_PASSWORD.
+  sign: ./scripts/sign.js
 
 nsis:
   oneClick: true
