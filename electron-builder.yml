@@ -1,0 +1,32 @@
+appId: app.zuppy.impressora
+productName: Zuppy Impressora
+copyright: Copyright © 2026 Zuppy Food
+
+directories:
+  output: release
+
+files:
+  - out
+  - resources
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: resources/icon.ico
+  artifactName: ZuppyImpressora-${version}-Setup.exe
+
+nsis:
+  oneClick: true
+  perMachine: false
+  allowToChangeInstallationDirectory: false
+  runAfterFinish: true
+  createDesktopShortcut: false
+  createStartMenuShortcut: true
+  shortcutName: Zuppy Impressora
+
+publish:
+  provider: github
+  owner: IsraelSousa01
+  repo: impressora-zuppy
+  releaseType: release
