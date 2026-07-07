@@ -34,6 +34,8 @@ export interface PrintJob {
   enqueuedAt: string
   /** Pre-fetched order data from polling */
   order?: OrderData
+  /** Já foi impresso? Trava reimpressão quando só o confirm falha e o job retenta. */
+  printed?: boolean
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -49,6 +51,14 @@ export const queueEvents = new EventEmitter()
 
 let queue: PrintJob[] = []
 let processing = false
+
+/**
+ * IDs de jobs já impressos nesta sessão do app. Barra reimpressão quando o
+ * mesmo job é re-entregue (ex.: catch-up de reconexão do stream). A fonte de
+ * verdade cross-sessão é o status 'printed' no servidor (o catch-up só traz
+ * 'pending'); isto cobre a janela até o confirm pegar.
+ */
+const printedJobIds = new Set<string>()
 
 // ─── Queue persistence ────────────────────────────────────────────────────────
 
@@ -142,17 +152,25 @@ async function processJob(job: PrintJob): Promise<void> {
   try {
     log.info(`Processing job ${job.id} (attempt ${job.retries + 1}/${MAX_RETRIES + 1})`)
 
-    // Use pre-fetched order data if available, otherwise fetch from API
-    const order = job.order ?? (await fetchOrderData(job.order_id))
-    job.order = order // Cache it in memory
-    job.order_number = String(order.order_number)
+    // Imprime UMA vez só. Se já imprimiu antes (retry porque só o confirm
+    // falhou), NÃO reimprime — apenas re-tenta o confirm. É isto que impede o
+    // loop de reimpressão quando o confirm dá erro (ex.: 401 do redirect).
+    if (!job.printed) {
+      // Use pre-fetched order data if available, otherwise fetch from API
+      const order = job.order ?? (await fetchOrderData(job.order_id))
+      job.order = order // Cache it in memory
+      job.order_number = String(order.order_number)
 
-    await printOrder(order, printerName)
+      await printOrder(order, printerName)
+      job.printed = true
+      printedJobIds.add(job.id)
+    }
+
     await confirmPrinted(job.id)
 
     logPrintResult({
       id: job.id,
-      order_number: job.order_number,
+      order_number: job.order_number ?? job.order_id,
       status: 'printed',
       timestamp: new Date().toISOString(),
     })
@@ -226,6 +244,12 @@ async function processQueue(): Promise<void> {
  * @param order   - Optional pre-fetched order data
  */
 export function addToQueue(jobId: string, orderId: string, order?: OrderData): void {
+  // Já impresso nesta sessão (ex.: re-entrega pelo catch-up de reconexão) →
+  // não reimprime.
+  if (printedJobIds.has(jobId)) {
+    log.warn(`Job ${jobId} já impresso, ignorando re-entrega`)
+    return
+  }
   // Deduplicate: don't add if already in queue
   if (queue.some((j) => j.id === jobId)) {
     log.warn(`Job ${jobId} already in queue, skipping`)
