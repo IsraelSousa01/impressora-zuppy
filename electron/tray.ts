@@ -1,68 +1,43 @@
 /**
  * electron/tray.ts
- * System tray icon and context menu management.
+ * Ícone da bandeja (system tray) e menu de contexto.
  *
- * - Green circle = connected to Supabase Realtime
- * - Red circle   = not configured or disconnected
- * - Clicking "Configurações" opens/focuses the settings window
+ * Mostra SÓ a marca Zuppy — sem bolinha colorida de conexão. O status real de
+ * conexão vive na tela de Impressão do Gestor (fonte da verdade); a bolinha na
+ * bandeja confundia e às vezes ficava desatualizada (dizia "desconectado"
+ * mesmo funcionando), então foi removida a pedido.
  */
 
-import { Tray, Menu, nativeImage, BrowserWindow, app } from 'electron'
+import { Tray, Menu, nativeImage, app } from 'electron'
 import path from 'path'
-import { getConfig, isConfigured } from './store'
-import { getConnectionStatus } from './realtime'
+import { getConfig } from './store'
 import { createLogger } from './logger'
 
 const log = createLogger('TRAY')
 
-// ─── Icon generation ──────────────────────────────────────────────────────────
+// ─── Ícone ────────────────────────────────────────────────────────────────────
 
-/**
- * Loads a 16x16 status dot tray icon from the resources folder.
- * @param color 'green' | 'red' | 'orange'
- */
-function getTrayIcon(color: 'green' | 'red' | 'orange'): Electron.NativeImage {
-  const iconPath = path.join(__dirname, '..', '..', 'resources', `${color}.png`)
+/** Ícone da marca Zuppy pra bandeja (sem cor de status). */
+function brandIcon(): Electron.NativeImage {
+  const iconPath = path.join(__dirname, '..', '..', 'resources', 'icon.png')
   const icon = nativeImage.createFromPath(iconPath)
   if (icon.isEmpty()) {
-    log.warn(`Tray icon empty at ${iconPath}, falling back to brand icon`)
-    const fallbackPath = path.join(__dirname, '..', '..', 'resources', 'icon.ico')
-    const fallback = nativeImage.createFromPath(fallbackPath)
-    return fallback
+    log.warn(`Tray icon vazio em ${iconPath}, caindo pro icon.ico`)
+    return nativeImage.createFromPath(
+      path.join(__dirname, '..', '..', 'resources', 'icon.ico'),
+    )
   }
   return icon
 }
 
-// ─── Tray state ───────────────────────────────────────────────────────────────
+// ─── Estado ───────────────────────────────────────────────────────────────────
 
 let tray: Tray | null = null
 
-/**
- * Returns the appropriate icon color based on current state.
- */
-function getCurrentColor(): 'green' | 'red' | 'orange' {
-  if (!isConfigured()) return 'red'
-  if (getConnectionStatus()) return 'green'
-  return 'orange'
-}
-
-/**
- * Returns the tooltip text for the tray icon.
- */
-function getTooltip(): string {
-  if (!isConfigured()) return 'Zuppy Impressora – Não configurado'
-  const cfg = getConfig()
-  if (getConnectionStatus()) {
-    return `Zuppy Impressora – Conectado (${cfg.tenant_name ?? cfg.tenant_id})`
-  }
-  return 'Zuppy Impressora – Desconectado'
-}
-
-// ─── Context menu ─────────────────────────────────────────────────────────────
+// ─── Menu de contexto ──────────────────────────────────────────────────────────
 
 function buildContextMenu(): Menu {
   const cfg = getConfig()
-  const connected = getConnectionStatus()
 
   return Menu.buildFromTemplate([
     {
@@ -70,14 +45,6 @@ function buildContextMenu(): Menu {
       enabled: false,
     },
     { type: 'separator' },
-    {
-      label: connected
-        ? `✅ Conectado – ${cfg.tenant_name ?? cfg.tenant_id ?? ''}`
-        : isConfigured()
-        ? '🟠 Desconectado'
-        : '🔴 Não configurado',
-      enabled: false,
-    },
     {
       label: `Impressora: ${cfg.printer_name ?? '(não selecionada)'}`,
       enabled: false,
@@ -92,18 +59,14 @@ function buildContextMenu(): Menu {
   ])
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ─── API pública ────────────────────────────────────────────────────────────────
 
-/**
- * Creates and shows the system tray icon.
- */
+/** Cria e mostra o ícone da bandeja. */
 export function createTray(): Tray {
   if (tray) return tray
 
-  const icon = getTrayIcon(getCurrentColor())
-
-  tray = new Tray(icon)
-  tray.setToolTip(getTooltip())
+  tray = new Tray(brandIcon())
+  tray.setToolTip('Zuppy Impressora')
   tray.setContextMenu(buildContextMenu())
 
   log.info('Tray icon created')
@@ -111,27 +74,18 @@ export function createTray(): Tray {
 }
 
 /**
- * Updates the tray icon and tooltip to reflect current connection state.
- * Call this whenever the Realtime connection status changes.
+ * Re-renderiza o menu da bandeja (ex.: quando a impressora selecionada muda).
+ * Mantido porque o main chama isso — não mexe mais em cor/status.
  */
 export function updateTray(): void {
   if (!tray) {
     log.warn('updateTray called before tray was created')
     return
   }
-
-  const color = getCurrentColor()
-  const icon = getTrayIcon(color)
-  tray.setImage(icon)
-  tray.setToolTip(getTooltip())
   tray.setContextMenu(buildContextMenu())
-
-  log.debug(`Tray updated: ${color}`)
 }
 
-/**
- * Destroys the tray icon (call on app quit).
- */
+/** Destrói o ícone da bandeja (no quit). */
 export function destroyTray(): void {
   if (tray) {
     tray.destroy()
