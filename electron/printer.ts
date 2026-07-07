@@ -16,13 +16,67 @@ import {
   CharacterSet,
   BreakLine,
 } from 'node-thermal-printer'
-import { exec } from 'child_process'
+import { exec, execFile } from 'child_process'
 import { promisify } from 'util'
+import { writeFile, unlink } from 'fs/promises'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { createLogger } from './logger'
 import { getConfig } from './store'
 
 const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
 const log = createLogger('PRINTER')
+
+/**
+ * Impressão RAW no Windows SEM módulo nativo.
+ *
+ * O node-thermal-printer, pra falar com a impressora do Windows, exige o módulo
+ * nativo `@thiagoelg/node-printer`, que precisa compilar com Visual Studio Build
+ * Tools — a máquina da loja não tem. Então montamos a comanda com o
+ * node-thermal-printer (getBuffer) e mandamos os bytes ESC/POS pro spooler do
+ * Windows via winspool.drv, chamado de dentro de um PowerShell (P/Invoke C#).
+ *
+ * O script vai em base64 pra não sofrer com escaping (here-string + aspas).
+ */
+const RAW_PRINT_PS1_B64 =
+  'cGFyYW0oCiAgW1BhcmFtZXRlcihNYW5kYXRvcnk9JHRydWUpXVtzdHJpbmddJFByaW50ZXJOYW1lLAogIFtQYXJhbWV0ZXIoTWFuZGF0b3J5PSR0cnVlKV1bc3RyaW5nXSREYXRhRmlsZQopCiRFcnJvckFjdGlvblByZWZlcmVuY2UgPSAnU3RvcCcKCkFkZC1UeXBlIC1UeXBlRGVmaW5pdGlvbiBAJwp1c2luZyBTeXN0ZW07CnVzaW5nIFN5c3RlbS5SdW50aW1lLkludGVyb3BTZXJ2aWNlczsKcHVibGljIGNsYXNzIFp1cHB5UmF3UHJpbnRlciB7CiAgW1N0cnVjdExheW91dChMYXlvdXRLaW5kLlNlcXVlbnRpYWwsIENoYXJTZXQ9Q2hhclNldC5Vbmljb2RlKV0KICBwdWJsaWMgc3RydWN0IERPQ0lORk8gewogICAgW01hcnNoYWxBcyhVbm1hbmFnZWRUeXBlLkxQV1N0cildIHB1YmxpYyBzdHJpbmcgcERvY05hbWU7CiAgICBbTWFyc2hhbEFzKFVubWFuYWdlZFR5cGUuTFBXU3RyKV0gcHVibGljIHN0cmluZyBwT3V0cHV0RmlsZTsKICAgIFtNYXJzaGFsQXMoVW5tYW5hZ2VkVHlwZS5MUFdTdHIpXSBwdWJsaWMgc3RyaW5nIHBEYXRhVHlwZTsKICB9CiAgW0RsbEltcG9ydCgid2luc3Bvb2wuZHJ2IiwgQ2hhclNldD1DaGFyU2V0LlVuaWNvZGUsIFNldExhc3RFcnJvcj10cnVlKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBPcGVuUHJpbnRlcihzdHJpbmcgc3JjLCBvdXQgSW50UHRyIGhQcmludGVyLCBJbnRQdHIgcGQpOwogIFtEbGxJbXBvcnQoIndpbnNwb29sLmRydiIsIFNldExhc3RFcnJvcj10cnVlKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBDbG9zZVByaW50ZXIoSW50UHRyIGhQcmludGVyKTsKICBbRGxsSW1wb3J0KCJ3aW5zcG9vbC5kcnYiLCBDaGFyU2V0PUNoYXJTZXQuVW5pY29kZSwgU2V0TGFzdEVycm9yPXRydWUpXSBwdWJsaWMgc3RhdGljIGV4dGVybiBib29sIFN0YXJ0RG9jUHJpbnRlcihJbnRQdHIgaFByaW50ZXIsIGludCBsZXZlbCwgcmVmIERPQ0lORk8gZGkpOwogIFtEbGxJbXBvcnQoIndpbnNwb29sLmRydiIsIFNldExhc3RFcnJvcj10cnVlKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBFbmREb2NQcmludGVyKEludFB0ciBoUHJpbnRlcik7CiAgW0RsbEltcG9ydCgid2luc3Bvb2wuZHJ2IiwgU2V0TGFzdEVycm9yPXRydWUpXSBwdWJsaWMgc3RhdGljIGV4dGVybiBib29sIFN0YXJ0UGFnZVByaW50ZXIoSW50UHRyIGhQcmludGVyKTsKICBbRGxsSW1wb3J0KCJ3aW5zcG9vbC5kcnYiLCBTZXRMYXN0RXJyb3I9dHJ1ZSldIHB1YmxpYyBzdGF0aWMgZXh0ZXJuIGJvb2wgRW5kUGFnZVByaW50ZXIoSW50UHRyIGhQcmludGVyKTsKICBbRGxsSW1wb3J0KCJ3aW5zcG9vbC5kcnYiLCBTZXRMYXN0RXJyb3I9dHJ1ZSldIHB1YmxpYyBzdGF0aWMgZXh0ZXJuIGJvb2wgV3JpdGVQcmludGVyKEludFB0ciBoUHJpbnRlciwgYnl0ZVtdIHBCeXRlcywgaW50IGR3Q291bnQsIG91dCBpbnQgZHdXcml0dGVuKTsKICBwdWJsaWMgc3RhdGljIHZvaWQgU2VuZChzdHJpbmcgcHJpbnRlciwgYnl0ZVtdIGJ5dGVzKSB7CiAgICBJbnRQdHIgaDsKICAgIGlmICghT3BlblByaW50ZXIocHJpbnRlciwgb3V0IGgsIEludFB0ci5aZXJvKSkgdGhyb3cgbmV3IEV4Y2VwdGlvbigiT3BlblByaW50ZXIgZmFsaG91IChlcnI9IiArIE1hcnNoYWwuR2V0TGFzdFdpbjMyRXJyb3IoKSArICIpIik7CiAgICB0cnkgewogICAgICBET0NJTkZPIGRpID0gbmV3IERPQ0lORk8oKTsgZGkucERvY05hbWUgPSAiWnVwcHkgQ29tYW5kYSI7IGRpLnBEYXRhVHlwZSA9ICJSQVciOwogICAgICBpZiAoIVN0YXJ0RG9jUHJpbnRlcihoLCAxLCByZWYgZGkpKSB0aHJvdyBuZXcgRXhjZXB0aW9uKCJTdGFydERvY1ByaW50ZXIgZmFsaG91IGVycj0iICsgTWFyc2hhbC5HZXRMYXN0V2luMzJFcnJvcigpKTsKICAgICAgdHJ5IHsKICAgICAgICBTdGFydFBhZ2VQcmludGVyKGgpOwogICAgICAgIGludCB3cml0dGVuOwogICAgICAgIGlmICghV3JpdGVQcmludGVyKGgsIGJ5dGVzLCBieXRlcy5MZW5ndGgsIG91dCB3cml0dGVuKSkgdGhyb3cgbmV3IEV4Y2VwdGlvbigiV3JpdGVQcmludGVyIGZhbGhvdSBlcnI9IiArIE1hcnNoYWwuR2V0TGFzdFdpbjMyRXJyb3IoKSk7CiAgICAgICAgRW5kUGFnZVByaW50ZXIoaCk7CiAgICAgIH0gZmluYWxseSB7IEVuZERvY1ByaW50ZXIoaCk7IH0KICAgIH0gZmluYWxseSB7IENsb3NlUHJpbnRlcihoKTsgfQogIH0KfQonQAoKJGJ5dGVzID0gW1N5c3RlbS5JTy5GaWxlXTo6UmVhZEFsbEJ5dGVzKCREYXRhRmlsZSkKW1p1cHB5UmF3UHJpbnRlcl06OlNlbmQoJFByaW50ZXJOYW1lLCAkYnl0ZXMpCldyaXRlLU91dHB1dCAoIk9LOiAiICsgJGJ5dGVzLkxlbmd0aCArICIgYnl0ZXMgLT4gJyIgKyAkUHJpbnRlck5hbWUgKyAiJyIpCg=='
+
+/**
+ * Manda o buffer ESC/POS pra impressora do Windows via spooler RAW.
+ * Escreve o script + os bytes em arquivos temporários e chama o powershell.
+ */
+async function sendRawToWindowsPrinter(
+  printerName: string,
+  data: Buffer,
+): Promise<void> {
+  const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`
+  const binFile = join(tmpdir(), `zuppy-print-${stamp}.bin`)
+  const ps1File = join(tmpdir(), `zuppy-rawprint-${stamp}.ps1`)
+  try {
+    await writeFile(binFile, data)
+    await writeFile(ps1File, Buffer.from(RAW_PRINT_PS1_B64, 'base64'))
+    await execFileAsync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        ps1File,
+        '-PrinterName',
+        printerName,
+        '-DataFile',
+        binFile,
+      ],
+      { timeout: 20000 },
+    )
+  } finally {
+    await unlink(binFile).catch(() => {})
+    await unlink(ps1File).catch(() => {})
+  }
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -66,19 +120,21 @@ function paperWidthMm(): 80 | 58 {
   return cfg.paper_size === '58mm' ? 58 : 80
 }
 
-/** Creates a configured ThermalPrinter instance for a given printer name */
-function createPrinter(printerName: string): ThermalPrinter {
+/**
+ * Cria um ThermalPrinter só pra MONTAR o buffer ESC/POS (getBuffer). A
+ * interface `tcp://` é dummy e nunca é usada — nunca chamamos execute(); a
+ * impressão real vai pelo spooler RAW do Windows (sendRawToWindowsPrinter).
+ * Assim não dependemos do módulo nativo do node-thermal-printer.
+ */
+function createPrinter(): ThermalPrinter {
   return new ThermalPrinter({
     type: PrinterTypes.EPSON,
-    interface: `printer:${printerName}`,
+    interface: 'tcp://localhost:9100',
     characterSet: CharacterSet.PC858_EURO,
     breakLine: BreakLine.WORD,
     lineCharacter: '-',
     width: paperWidthMm() === 58 ? 32 : 48,
     removeSpecialCharacters: false,
-    options: {
-      timeout: 10000,
-    },
   })
 }
 
@@ -359,21 +415,17 @@ export async function printOrder(
   log.info(`Printing order #${order.order_number} on "${printerName}"`)
 
   // ── Kitchen ticket ──
-  const kitchenPrinter = createPrinter(printerName)
+  const kitchenPrinter = createPrinter()
   await buildKitchenTicketBytes(kitchenPrinter, order)
-  const kitchenOk = await kitchenPrinter.isPrinterConnected()
-  if (!kitchenOk) {
-    throw new Error(`Printer "${printerName}" is not connected`)
-  }
-  await kitchenPrinter.execute()
+  await sendRawToWindowsPrinter(printerName, kitchenPrinter.getBuffer())
 
   // Small gap between tickets
   await new Promise<void>((r) => setTimeout(r, 300))
 
   // ── Operational ticket ──
-  const opPrinter = createPrinter(printerName)
+  const opPrinter = createPrinter()
   await buildOperationalTicketBytes(opPrinter, order)
-  await opPrinter.execute()
+  await sendRawToWindowsPrinter(printerName, opPrinter.getBuffer())
 
   log.info(`Order #${order.order_number} printed successfully`)
 }
@@ -385,7 +437,7 @@ export async function printOrder(
  */
 export async function testPrint(printerName: string): Promise<void> {
   log.info(`Test print on "${printerName}"`)
-  const printer = createPrinter(printerName)
+  const printer = createPrinter()
 
   printer.alignCenter()
   printer.bold(true)
@@ -408,10 +460,6 @@ export async function testPrint(printerName: string): Promise<void> {
   printer.println('Powered by Zuppy Food')
   printer.cut()
 
-  const connected = await printer.isPrinterConnected()
-  if (!connected) {
-    throw new Error(`Printer "${printerName}" is not connected`)
-  }
-  await printer.execute()
+  await sendRawToWindowsPrinter(printerName, printer.getBuffer())
   log.info('Test print completed')
 }

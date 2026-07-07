@@ -218,7 +218,15 @@ async function connectSSEStream(): Promise<void> {
   // Fetch pending jobs once to sync up any missed prints during offline state
   await fetchPendingJobsCatchUp(cfg.session_token!)
 
-  const streamUrl = `${ZUPPY_APP_URL}/api/printer/jobs/stream?token=${cfg.session_token}`
+  // Dispara o loop do stream em segundo plano — NÃO dá await, senão connect()
+  // (e o POST /configure, que faz `await connect()`) travariam pra sempre: o
+  // loop de leitura só encerra quando o stream cai. Foi o que quebrou o
+  // "salvar impressora/papel" no 1.0.1.
+  void runSSELoop(cfg.session_token!)
+}
+
+async function runSSELoop(sessionToken: string): Promise<void> {
+  const streamUrl = `${ZUPPY_APP_URL}/api/printer/jobs/stream?token=${sessionToken}`
   log.info(`Connecting SSE stream: ${ZUPPY_APP_URL}/api/printer/jobs/stream`)
 
   resetKeepAliveTimeout()
