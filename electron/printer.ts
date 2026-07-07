@@ -23,6 +23,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { createLogger } from './logger'
 import { getConfig } from './store'
+import { ZUPPY_APP_URL } from './config'
 
 const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
@@ -160,6 +161,21 @@ function paymentLabel(method: string | null): string {
     voucher: 'Vale-Refeição',
   }
   return method ? (map[method] ?? method) : 'Não informado'
+}
+
+/**
+ * Monta o link de rota (/nav) pro QR — curto DE PROPÓSITO (só as coordenadas,
+ * ou o endereço se não houver GPS) pra o QR ficar compacto e fácil de
+ * escanear. Só faz sentido em entrega (retirada não tem rota).
+ */
+function buildNavUrl(order: OrderData): string | null {
+  if (order.pickup_code) return null
+  const hasCoords = order.customer_lat != null && order.customer_lng != null
+  const navDest = hasCoords
+    ? `${order.customer_lat},${order.customer_lng}`
+    : (order.customer_address ?? '')
+  if (!navDest) return null
+  return `${ZUPPY_APP_URL.replace(/\/+$/, '')}/nav?to=${encodeURIComponent(navDest)}`
 }
 
 // ─── ESC/POS Ticket Builders ──────────────────────────────────────────────────
@@ -355,6 +371,17 @@ export async function buildOperationalTicketBytes(
     printer.println(order.customer_address)
     if (order.customer_reference) {
       printer.println(`Referência: ${order.customer_reference}`)
+    }
+
+    // Rota até o cliente (QR do /nav) — só entrega. Link curto = QR compacto e
+    // fácil de ler. Impressora sem suporte a QR nativo ignora (a via sai igual).
+    const navUrl = buildNavUrl(order)
+    if (navUrl) {
+      printer.drawLine()
+      printer.alignCenter()
+      printer.println('Rota até o cliente:')
+      printer.printQR(navUrl, { cellSize: 6, correction: 'M', model: 2 })
+      printer.alignLeft()
     }
   }
 
