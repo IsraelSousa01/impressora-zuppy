@@ -26,7 +26,7 @@ nsis:
   perMachine: false
   allowToChangeInstallationDirectory: false
   runAfterFinish: true
-  createDesktopShortcut: false
+  createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: Zuppy Impressora
 
