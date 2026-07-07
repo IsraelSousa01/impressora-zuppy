@@ -11,7 +11,7 @@
  *
  * Security:
  *   - Binds to 127.0.0.1 only (never 0.0.0.0)
- *   - CORS restricted to https://zuppyfood.app and http://localhost:*
+ *   - CORS restricted to *.zuppyfood.com.br and http://localhost:*
  */
 
 import express, { Request, Response, NextFunction } from 'express'
@@ -116,6 +116,16 @@ function buildRouter() {
     }
 
     try {
+      // Trocar de dispositivo/loja invalida a sessão anterior: ela pertence ao
+      // tenant antigo. Se não zerar, connectSSEStream() vê session_token
+      // presente e PULA a re-autenticação (realtime.ts), reusando a sessão da
+      // loja anterior — o app nunca reconecta e fica preso em "conectando".
+      // (Bug real: app da PIZZA PIZZA reusando a session_token da Praça Zuppy.)
+      const current = getConfig()
+      const identityChanged =
+        current.device_token !== device_token ||
+        (tenant_id !== undefined && current.tenant_id !== tenant_id)
+
       // Persist configuration
       setConfig({
         device_token,
@@ -124,9 +134,18 @@ function buildRouter() {
         ...(auto_print !== undefined && { auto_print }),
         ...(printer_name !== undefined && { printer_name }),
         ...(paper_size !== undefined && { paper_size }),
+        // Zera a sessão só quando a identidade muda — força re-login com o
+        // device_token novo. Trocas de impressora/papel preservam a sessão.
+        ...(identityChanged && {
+          session_token: undefined,
+          session_expires_at: undefined,
+        }),
       })
 
-      log.info(`Configuration updated with device_token: ${device_token}`)
+      log.info(
+        `Configuration updated with device_token: ${device_token}` +
+          (identityChanged ? ' (identidade mudou — sessão zerada)' : '')
+      )
 
       // Reconnect polling with new config
       await disconnect()
