@@ -13,8 +13,6 @@
  */
 
 import { EventEmitter } from 'events'
-import http from 'http'
-import https from 'https'
 import { getConfig, setConfig, isConfigured } from './store'
 import { addToQueue } from './print-queue'
 import { createLogger } from './logger'
@@ -32,7 +30,7 @@ export const realtimeEvents = new EventEmitter()
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-let activeRequest: http.ClientRequest | null = null
+let activeController: AbortController | null = null
 let keepAliveTimeout: ReturnType<typeof setTimeout> | null = null
 let reconnectTimeout: ReturnType<typeof setTimeout> | null = null
 let reconnectAttempts = 0
@@ -200,6 +198,11 @@ function parseSSEEvent(block: string): void {
 
 /**
  * Connects to the SSE endpoint on the backend.
+ *
+ * Usa `fetch` (streaming via ReadableStream), não `http.request`: no ambiente
+ * do Electron o cliente clássico não completava a conexão do SSE com a nuvem
+ * (0 conexões chegavam no servidor), enquanto o `fetch` do auth e do catch-up
+ * funcionava. Alinhar o stream ao mesmo transporte destrava a conexão.
  */
 async function connectSSEStream(): Promise<void> {
   let cfg = getConfig()
@@ -215,71 +218,69 @@ async function connectSSEStream(): Promise<void> {
   // Fetch pending jobs once to sync up any missed prints during offline state
   await fetchPendingJobsCatchUp(cfg.session_token!)
 
-  const isHttps = ZUPPY_APP_URL.startsWith('https')
-  const client = isHttps ? https : http
   const streamUrl = `${ZUPPY_APP_URL}/api/printer/jobs/stream?token=${cfg.session_token}`
-
   log.info(`Connecting SSE stream: ${ZUPPY_APP_URL}/api/printer/jobs/stream`)
 
   resetKeepAliveTimeout()
 
-  const req = client.request(
-    streamUrl,
-    {
+  const controller = new AbortController()
+  activeController = controller
+
+  try {
+    const res = await fetch(streamUrl, {
       method: 'GET',
       headers: {
-        'Accept': 'text/event-stream',
+        Accept: 'text/event-stream',
         'Cache-Control': 'no-cache',
       },
-    },
-    (res) => {
-      if (res.statusCode === 401) {
-        log.warn('SSE unauthorized (401). Invalidating session and reconnecting…')
-        setConfig({ session_token: undefined })
-        reconnect()
-        return
-      }
+      signal: controller.signal,
+    })
 
-      if (res.statusCode !== 200) {
-        log.error(`SSE stream returned status code ${res.statusCode}`)
-        reconnect()
-        return
-      }
+    if (res.status === 401) {
+      log.warn('SSE unauthorized (401). Invalidating session and reconnecting…')
+      setConfig({ session_token: undefined })
+      reconnect()
+      return
+    }
 
-      let buffer = ''
+    if (!res.ok || !res.body) {
+      log.error(`SSE stream returned status code ${res.status}`)
+      reconnect()
+      return
+    }
 
-      res.on('data', (chunk: Buffer) => {
-        resetKeepAliveTimeout() // Heartbeat received
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
 
-        buffer += chunk.toString()
-        const parts = buffer.split('\n\n')
-        buffer = parts.pop() || ''
-
-        for (const part of parts) {
-          const trimmed = part.trim()
-          if (trimmed) parseSSEEvent(trimmed)
-        }
-      })
-
-      res.on('end', () => {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) {
         log.info('SSE stream ended by server')
         reconnect()
-      })
+        return
+      }
 
-      res.on('error', (err) => {
-        log.error('SSE response stream error:', err)
-        reconnect()
-      })
+      resetKeepAliveTimeout() // Heartbeat/data received
+
+      buffer += decoder.decode(value, { stream: true })
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() || ''
+
+      for (const part of parts) {
+        const trimmed = part.trim()
+        if (trimmed) parseSSEEvent(trimmed)
+      }
     }
-  )
-
-  req.on('error', (err) => {
-    log.error('SSE request connection error:', err)
+  } catch (err) {
+    // abort() proposital (reconnect/disconnect) não é erro real
+    if (controller.signal.aborted) return
+    log.error(
+      'SSE request connection error:',
+      err instanceof Error ? err.message : String(err)
+    )
     reconnect()
-  })
-
-  req.end()
-  activeRequest = req
+  }
 }
 
 function scheduleReconnect(): void {
@@ -299,9 +300,9 @@ function scheduleReconnect(): void {
 }
 
 function reconnect(): void {
-  if (activeRequest) {
-    activeRequest.destroy()
-    activeRequest = null
+  if (activeController) {
+    activeController.abort()
+    activeController = null
   }
   scheduleReconnect()
 }
@@ -336,9 +337,9 @@ export async function disconnect(): Promise<void> {
 
   clearTimers()
 
-  if (activeRequest) {
-    activeRequest.destroy()
-    activeRequest = null
+  if (activeController) {
+    activeController.abort()
+    activeController = null
   }
 
   if (isCurrentlyConnected) {
