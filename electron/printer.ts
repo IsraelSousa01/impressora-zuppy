@@ -231,9 +231,11 @@ export async function buildKitchenTicketBytes(
 
     // Item notes
     if (item.notes) {
-      printer.italic(true)
+      // bold() no lugar de italic(): italic() nao existe nesta versao do
+      // node-thermal-printer (crashava "printer.italic is not a function" em obs).
+      printer.bold(true)
       printer.println(`  Obs: ${item.notes}`)
-      printer.italic(false)
+      printer.bold(false)
     }
   }
 
@@ -323,9 +325,11 @@ export async function buildOperationalTicketBytes(
     }
 
     if (item.notes) {
-      printer.italic(true)
+      // bold() no lugar de italic(): italic() nao existe nesta versao do
+      // node-thermal-printer (crashava "printer.italic is not a function" em obs).
+      printer.bold(true)
       printer.println(`  Obs: ${item.notes}`)
-      printer.italic(false)
+      printer.bold(false)
     }
   }
 
