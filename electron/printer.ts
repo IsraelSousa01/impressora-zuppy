@@ -113,6 +113,17 @@ export interface OrderData {
   order_items: OrderItem[]
 }
 
+/**
+ * Comanda já renderizada pelo servidor (motor lib/comanda, M1 Parte 2/3).
+ * O app só decodifica e imprime — não monta nada.
+ */
+export interface RenderedComanda {
+  template: string
+  bytes_base64: string
+  copies: number
+  render_hash?: string
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Returns the configured paper width in mm as a number */
@@ -455,6 +466,33 @@ export async function printOrder(
   await sendRawToWindowsPrinter(printerName, opPrinter.getBuffer())
 
   log.info(`Order #${order.order_number} printed successfully`)
+}
+
+/**
+ * Imprime comandas JÁ RENDERIZADAS pelo servidor (cliente-burro): decodifica os
+ * bytes ESC/POS base64 e manda RAW pro spooler, × cópias, com gap entre elas.
+ * Não monta nada — o servidor decide o layout (comanda configurável).
+ */
+export async function printRenderedComandas(
+  render: RenderedComanda[],
+  printerName: string,
+): Promise<void> {
+  log.info(`Printing ${render.length} pre-rendered comanda(s) on "${printerName}"`)
+  let first = true
+  for (const comanda of render) {
+    if (!comanda.bytes_base64) {
+      log.warn(`Skipping comanda "${comanda.template}" with empty bytes`)
+      continue
+    }
+    const bytes = Buffer.from(comanda.bytes_base64, 'base64')
+    const copies = Math.max(1, Math.min(4, Math.floor(comanda.copies || 1)))
+    for (let i = 0; i < copies; i++) {
+      if (!first) await new Promise<void>((r) => setTimeout(r, 300))
+      first = false
+      await sendRawToWindowsPrinter(printerName, bytes)
+    }
+  }
+  log.info('Pre-rendered comandas printed successfully')
 }
 
 /**
