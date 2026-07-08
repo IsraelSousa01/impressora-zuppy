@@ -259,6 +259,16 @@ async function runSSELoop(sessionToken: string): Promise<void> {
       return
     }
 
+    // Conectado assim que o stream responde 200 — NÃO espera o `event: open`.
+    // Robustez: se o `open` for engolido por buffer/proxy do serverless, o app
+    // não fica preso em "conectando" (o handler de `event: open` abaixo continua,
+    // mas idempotente via o guard `!isCurrentlyConnected`).
+    reconnectAttempts = 0
+    if (!isCurrentlyConnected) {
+      isCurrentlyConnected = true
+      realtimeEvents.emit('connected')
+    }
+
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''

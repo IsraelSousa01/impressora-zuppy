@@ -1,6 +1,6 @@
 {
   "name": "impressora-zuppy",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "App de impressão automática para Zuppy Food",
   "author": "Zuppy Food",
   "main": "out/main/index.js",
