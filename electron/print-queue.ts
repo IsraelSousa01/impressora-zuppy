@@ -12,7 +12,7 @@
  */
 
 import { EventEmitter } from 'events'
-import { printOrder, type OrderData } from './printer'
+import { printOrder, printRenderedComandas, type OrderData, type RenderedComanda } from './printer'
 import { getConfig, savePendingQueue, addLog } from './store'
 import { createLogger, logPrintResult } from './logger'
 import { ZUPPY_APP_URL } from './config'
@@ -34,6 +34,8 @@ export interface PrintJob {
   enqueuedAt: string
   /** Pre-fetched order data from polling */
   order?: OrderData
+  /** Comandas já renderizadas pelo servidor (M1 P2/P3). Se presente, imprime estes bytes em vez de montar local. */
+  render?: RenderedComanda[]
   /** Já foi impresso? Trava reimpressão quando só o confirm falha e o job retenta. */
   printed?: boolean
 }
@@ -69,10 +71,10 @@ function persistQueue(): void {
 // ─── Core logic ───────────────────────────────────────────────────────────────
 
 /**
- * Fetches full order data from Next.js API for a given order_id.
- * Used only when the enqueued job has no pre-fetched order data (e.g. crash recovery).
+ * Fetches order data + server-rendered comandas from the Next.js API.
+ * Used only when the enqueued job has no pre-fetched data (e.g. crash recovery).
  */
-async function fetchOrderData(orderId: string): Promise<OrderData> {
+async function fetchJobData(orderId: string): Promise<{ order: OrderData; render?: RenderedComanda[] }> {
   const cfg = getConfig()
   if (!cfg.session_token) throw new Error('No printer session active')
 
@@ -89,10 +91,10 @@ async function fetchOrderData(orderId: string): Promise<OrderData> {
     throw new Error(`Order fetch API returned ${res.status}: ${text}`)
   }
 
-  const data = (await res.json()) as { order: OrderData }
+  const data = (await res.json()) as { order: OrderData; render?: RenderedComanda[] }
   if (!data.order) throw new Error(`Order ${orderId} not returned by API`)
 
-  return data.order
+  return { order: data.order, render: data.render }
 }
 
 /**
@@ -156,12 +158,28 @@ async function processJob(job: PrintJob): Promise<void> {
     // falhou), NÃO reimprime — apenas re-tenta o confirm. É isto que impede o
     // loop de reimpressão quando o confirm dá erro (ex.: 401 do redirect).
     if (!job.printed) {
-      // Use pre-fetched order data if available, otherwise fetch from API
-      const order = job.order ?? (await fetchOrderData(job.order_id))
-      job.order = order // Cache it in memory
-      job.order_number = String(order.order_number)
+      // Garante dados pra imprimir (crash-recovery busca do servidor: order + render[])
+      if (!job.render && !job.order) {
+        const fetched = await fetchJobData(job.order_id)
+        job.order = fetched.order
+        job.render = fetched.render
+      }
+      if (job.order) job.order_number = String(job.order.order_number)
 
-      await printOrder(order, printerName)
+      // Cliente-burro: prefere os bytes já renderizados pelo servidor (comanda
+      // configurável). Guard de papel: o servidor renderiza 48 col (80mm) hoje;
+      // num 58mm cai no build local pra não sair torto (sync de largura vem depois).
+      const paper58 = getConfig().paper_size === '58mm'
+      if (job.render && job.render.length > 0 && !paper58) {
+        await printRenderedComandas(job.render, printerName)
+      } else if (job.order) {
+        if (job.render && job.render.length > 0 && paper58) {
+          log.info(`Job ${job.id}: render[] do servidor ignorado (papel 58mm), usando build local`)
+        }
+        await printOrder(job.order, printerName)
+      } else {
+        throw new Error(`Job ${job.id}: sem render[] nem order pra imprimir`)
+      }
       job.printed = true
       printedJobIds.add(job.id)
     }
@@ -242,8 +260,9 @@ async function processQueue(): Promise<void> {
  * @param jobId   - UUID from print_jobs table
  * @param orderId - UUID of the related order
  * @param order   - Optional pre-fetched order data
+ * @param render  - Optional server-rendered comandas (M1 P2/P3); imprime estes bytes se presente
  */
-export function addToQueue(jobId: string, orderId: string, order?: OrderData): void {
+export function addToQueue(jobId: string, orderId: string, order?: OrderData, render?: RenderedComanda[]): void {
   // Já impresso nesta sessão (ex.: re-entrega pelo catch-up de reconexão) →
   // não reimprime.
   if (printedJobIds.has(jobId)) {
@@ -262,6 +281,7 @@ export function addToQueue(jobId: string, orderId: string, order?: OrderData): v
     retries: 0,
     enqueuedAt: new Date().toISOString(),
     order,
+    render,
   }
 
   if (order) {

@@ -15,6 +15,7 @@
 import { EventEmitter } from 'events'
 import { getConfig, setConfig, isConfigured } from './store'
 import { addToQueue } from './print-queue'
+import type { RenderedComanda } from './printer'
 import { createLogger } from './logger'
 import { ZUPPY_APP_URL } from './config'
 
@@ -134,13 +135,14 @@ async function fetchPendingJobsCatchUp(sessionToken: string): Promise<void> {
         order_id: string
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         order: any
+        render?: RenderedComanda[]
       }>
     }
 
     if (data.jobs && data.jobs.length > 0) {
       log.info(`Catch-up: found ${data.jobs.length} pending print jobs`)
       for (const job of data.jobs) {
-        addToQueue(job.id, job.order_id, job.order)
+        addToQueue(job.id, job.order_id, job.order, job.render)
       }
     }
   } catch (err) {
@@ -180,9 +182,9 @@ function parseSSEEvent(block: string): void {
 
   if (eventType === 'new_job' && dataStr) {
     try {
-      const job = JSON.parse(dataStr) as { id: string; order_id: string; order: unknown }
+      const job = JSON.parse(dataStr) as { id: string; order_id: string; order: unknown; render?: RenderedComanda[] }
       log.info(`SSE: Received new job event ${job.id}`)
-      addToQueue(job.id, job.order_id, job.order as Parameters<typeof addToQueue>[2])
+      addToQueue(job.id, job.order_id, job.order as Parameters<typeof addToQueue>[2], job.render)
     } catch (e) {
       log.error('Failed to parse new_job event data:', e)
     }
