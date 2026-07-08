@@ -479,20 +479,31 @@ export async function printRenderedComandas(
 ): Promise<void> {
   log.info(`Printing ${render.length} pre-rendered comanda(s) on "${printerName}"`)
   let first = true
+  let sent = 0
   for (const comanda of render) {
-    if (!comanda.bytes_base64) {
-      log.warn(`Skipping comanda "${comanda.template}" with empty bytes`)
+    if (!comanda?.bytes_base64) {
+      log.warn(`Skipping comanda "${comanda?.template}" with empty bytes`)
       continue
     }
     const bytes = Buffer.from(comanda.bytes_base64, 'base64')
-    const copies = Math.max(1, Math.min(4, Math.floor(comanda.copies || 1)))
+    // copies pode vir malformado do servidor (cliente-burro não confia): Number()
+    // + guarda de finitude evita loop com NaN (rodaria 0×, sumindo a via).
+    const n = Math.floor(Number(comanda.copies))
+    const copies = Number.isFinite(n) ? Math.max(1, Math.min(4, n)) : 1
     for (let i = 0; i < copies; i++) {
       if (!first) await new Promise<void>((r) => setTimeout(r, 300))
       first = false
       await sendRawToWindowsPrinter(printerName, bytes)
+      sent++
     }
   }
-  log.info('Pre-rendered comandas printed successfully')
+  // NUNCA reportar sucesso sem imprimir nada: se render[] veio mas nada saiu
+  // (bytes vazios / payload malformado do servidor), falha ALTO → o job cai no
+  // retry/confirmFailed em vez de virar "impresso fantasma" e sumir a comanda.
+  if (sent === 0) {
+    throw new Error('render[] presente mas nada imprimivel (bytes vazios/invalidos)')
+  }
+  log.info(`Pre-rendered comandas printed (${sent} impressao(oes))`)
 }
 
 /**

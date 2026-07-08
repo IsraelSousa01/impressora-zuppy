@@ -158,27 +158,29 @@ async function processJob(job: PrintJob): Promise<void> {
     // falhou), NÃO reimprime — apenas re-tenta o confirm. É isto que impede o
     // loop de reimpressão quando o confirm dá erro (ex.: 401 do redirect).
     if (!job.printed) {
-      // Garante dados pra imprimir (crash-recovery busca do servidor: order + render[])
-      if (!job.render && !job.order) {
+      // Garante o `order` disponível (fallback local sempre possível). Só busca
+      // se faltar — crash-recovery restaura só os IDs; o servidor traz render[]
+      // junto no fetch. fetchJobData lança se a API não devolver order.
+      if (!job.order) {
         const fetched = await fetchJobData(job.order_id)
         job.order = fetched.order
-        job.render = fetched.render
+        if (!job.render) job.render = fetched.render
       }
-      if (job.order) job.order_number = String(job.order.order_number)
+      job.order_number = String(job.order.order_number)
 
       // Cliente-burro: prefere os bytes já renderizados pelo servidor (comanda
       // configurável). Guard de papel: o servidor renderiza 48 col (80mm) hoje;
       // num 58mm cai no build local pra não sair torto (sync de largura vem depois).
-      const paper58 = getConfig().paper_size === '58mm'
-      if (job.render && job.render.length > 0 && !paper58) {
-        await printRenderedComandas(job.render, printerName)
-      } else if (job.order) {
-        if (job.render && job.render.length > 0 && paper58) {
+      const paper58 = cfg.paper_size === '58mm'
+      const renderable =
+        Array.isArray(job.render) && job.render.length > 0 ? job.render : null
+      if (renderable && !paper58) {
+        await printRenderedComandas(renderable, printerName)
+      } else {
+        if (renderable && paper58) {
           log.info(`Job ${job.id}: render[] do servidor ignorado (papel 58mm), usando build local`)
         }
         await printOrder(job.order, printerName)
-      } else {
-        throw new Error(`Job ${job.id}: sem render[] nem order pra imprimir`)
       }
       job.printed = true
       printedJobIds.add(job.id)
