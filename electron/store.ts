@@ -25,6 +25,14 @@ export interface AppConfig {
   printer_name: string
   /** Thermal paper width */
   paper_size: '80mm' | '58mm'
+  /**
+   * Colunas de texto medidas por calibração explícita do usuário (não um
+   * palpite derivado de `paper_size`). Só existe depois de uma calibração
+   * real; ausente = "não calibrado ainda". Enviado no handshake
+   * (electron/realtime.ts) para o servidor render comandas na largura
+   * exata desta impressora.
+   */
+  columns?: number
 }
 
 /** A single entry in the recent-prints log */

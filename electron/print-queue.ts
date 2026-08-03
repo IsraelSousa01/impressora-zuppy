@@ -12,7 +12,7 @@
  */
 
 import { EventEmitter } from 'events'
-import { printOrder, printRenderedComandas, type OrderData, type RenderedComanda } from './printer'
+import { printOrder, printRenderedComandas, stationColumns, type OrderData, type RenderedComanda } from './printer'
 import { getConfig, savePendingQueue, addLog } from './store'
 import { createLogger, logPrintResult } from './logger'
 import { ZUPPY_APP_URL } from './config'
@@ -36,8 +36,67 @@ export interface PrintJob {
   order?: OrderData
   /** Comandas já renderizadas pelo servidor (M1 P2/P3). Se presente, imprime estes bytes em vez de montar local. */
   render?: RenderedComanda[]
+  /**
+   * Largura (em colunas) em que o servidor montou os bytes de `render`.
+   * Campo aditivo — servidor antigo não manda. Ausência é tratada como
+   * "largura desconhecida" (fallback conservador), não como "cabe".
+   */
+  resolved_columns?: number
   /** Já foi impresso? Trava reimpressão quando só o confirm falha e o job retenta. */
   printed?: boolean
+}
+
+// ─── Cutover: bytes do servidor vs. build local ────────────────────────────────
+
+export interface RenderPathDecision {
+  /** true → imprime job.render (bytes do servidor); false → cai no printOrder local. */
+  useServerRender: boolean
+  /** Motivo legível, para log — precisa dar pra diagnosticar loja em campo sem adivinhação. */
+  reason: string
+}
+
+/**
+ * Decide entre os bytes já renderizados pelo servidor (`render[]`) e o build
+ * local (`printOrder`), comparando a largura em que o servidor montou os
+ * bytes (`renderColumns`) com a largura real desta estação (`stationCols`,
+ * ver `stationColumns()` em printer.ts).
+ *
+ * Regras:
+ *  - sem `render[]` presente → nada a decidir, build local.
+ *  - `renderColumns` ausente (servidor antigo, sem o campo aditivo) →
+ *    fallback conservador: build local (não dá pra confiar numa largura que
+ *    não foi informada).
+ *  - `renderColumns <= stationCols` → os bytes do servidor cabem, usa eles.
+ *  - `renderColumns > stationCols` → os bytes são largos demais pra esta
+ *    estação, imprimiriam cortados/estourados: cai no build local.
+ */
+export function decideRenderPath(
+  renderColumns: number | undefined,
+  stationCols: number,
+  hasRender: boolean,
+): RenderPathDecision {
+  if (!hasRender) {
+    return { useServerRender: false, reason: 'sem render[] do servidor, build local' }
+  }
+
+  if (renderColumns === undefined) {
+    return {
+      useServerRender: false,
+      reason: `resolved_columns ausente (servidor antigo) — fallback conservador, build local (estação=${stationCols}col)`,
+    }
+  }
+
+  if (renderColumns <= stationCols) {
+    return {
+      useServerRender: true,
+      reason: `resolved_columns=${renderColumns} cabe na estação (${stationCols}col) — usando bytes do servidor`,
+    }
+  }
+
+  return {
+    useServerRender: false,
+    reason: `resolved_columns=${renderColumns} maior que a estação (${stationCols}col) — build local para não estourar a largura`,
+  }
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -74,7 +133,9 @@ function persistQueue(): void {
  * Fetches order data + server-rendered comandas from the Next.js API.
  * Used only when the enqueued job has no pre-fetched data (e.g. crash recovery).
  */
-async function fetchJobData(orderId: string): Promise<{ order: OrderData; render?: RenderedComanda[] }> {
+async function fetchJobData(
+  orderId: string
+): Promise<{ order: OrderData; render?: RenderedComanda[]; resolved_columns?: number }> {
   const cfg = getConfig()
   if (!cfg.session_token) throw new Error('No printer session active')
 
@@ -91,10 +152,14 @@ async function fetchJobData(orderId: string): Promise<{ order: OrderData; render
     throw new Error(`Order fetch API returned ${res.status}: ${text}`)
   }
 
-  const data = (await res.json()) as { order: OrderData; render?: RenderedComanda[] }
+  const data = (await res.json()) as {
+    order: OrderData
+    render?: RenderedComanda[]
+    resolved_columns?: number
+  }
   if (!data.order) throw new Error(`Order ${orderId} not returned by API`)
 
-  return { order: data.order, render: data.render }
+  return { order: data.order, render: data.render, resolved_columns: data.resolved_columns }
 }
 
 /**
@@ -165,21 +230,22 @@ async function processJob(job: PrintJob): Promise<void> {
         const fetched = await fetchJobData(job.order_id)
         job.order = fetched.order
         if (!job.render) job.render = fetched.render
+        if (job.resolved_columns === undefined) job.resolved_columns = fetched.resolved_columns
       }
       job.order_number = String(job.order.order_number)
 
       // Cliente-burro: prefere os bytes já renderizados pelo servidor (comanda
-      // configurável). Guard de papel: o servidor renderiza 48 col (80mm) hoje;
-      // num 58mm cai no build local pra não sair torto (sync de largura vem depois).
-      const paper58 = cfg.paper_size === '58mm'
+      // configurável), mas só quando cabem na largura REAL desta estação —
+      // comparação explícita, não palpite por paper_size (ver decideRenderPath).
       const renderable =
         Array.isArray(job.render) && job.render.length > 0 ? job.render : null
-      if (renderable && !paper58) {
+      const stationCols = stationColumns()
+      const decision = decideRenderPath(job.resolved_columns, stationCols, renderable !== null)
+      log.info(`Job ${job.id}: ${decision.reason}`)
+
+      if (renderable && decision.useServerRender) {
         await printRenderedComandas(renderable, printerName)
       } else {
-        if (renderable && paper58) {
-          log.info(`Job ${job.id}: render[] do servidor ignorado (papel 58mm), usando build local`)
-        }
         await printOrder(job.order, printerName)
       }
       job.printed = true
@@ -261,10 +327,17 @@ async function processQueue(): Promise<void> {
  *
  * @param jobId   - UUID from print_jobs table
  * @param orderId - UUID of the related order
- * @param order   - Optional pre-fetched order data
- * @param render  - Optional server-rendered comandas (M1 P2/P3); imprime estes bytes se presente
+ * @param order         - Optional pre-fetched order data
+ * @param render        - Optional server-rendered comandas (M1 P2/P3); imprime estes bytes se presente
+ * @param renderColumns - Largura (colunas) em que o servidor montou `render`; ausente = servidor antigo
  */
-export function addToQueue(jobId: string, orderId: string, order?: OrderData, render?: RenderedComanda[]): void {
+export function addToQueue(
+  jobId: string,
+  orderId: string,
+  order?: OrderData,
+  render?: RenderedComanda[],
+  renderColumns?: number
+): void {
   // Já impresso nesta sessão (ex.: re-entrega pelo catch-up de reconexão) →
   // não reimprime.
   if (printedJobIds.has(jobId)) {
@@ -284,6 +357,7 @@ export function addToQueue(jobId: string, orderId: string, order?: OrderData, re
     enqueuedAt: new Date().toISOString(),
     order,
     render,
+    resolved_columns: renderColumns,
   }
 
   if (order) {
