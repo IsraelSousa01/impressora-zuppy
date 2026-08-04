@@ -76,7 +76,15 @@ async function authenticate(): Promise<boolean> {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ device_token: cfg.device_token }),
+      body: JSON.stringify({
+        device_token: cfg.device_token,
+        paper_size: cfg.paper_size,
+        // `columns` só vai quando o usuário calibrou de verdade (ver
+        // AppConfig.columns em store.ts) — nunca inferido a partir de
+        // paper_size. Mandar um palpite como se fosse medição é o erro que
+        // o servidor foi corrigido para não cometer.
+        ...(cfg.columns !== undefined && { columns: cfg.columns }),
+      }),
     })
 
     if (!res.ok) {
@@ -136,13 +144,14 @@ async function fetchPendingJobsCatchUp(sessionToken: string): Promise<void> {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         order: any
         render?: RenderedComanda[]
+        resolved_columns?: number
       }>
     }
 
     if (data.jobs && data.jobs.length > 0) {
       log.info(`Catch-up: found ${data.jobs.length} pending print jobs`)
       for (const job of data.jobs) {
-        addToQueue(job.id, job.order_id, job.order, job.render)
+        addToQueue(job.id, job.order_id, job.order, job.render, job.resolved_columns)
       }
     }
   } catch (err) {
@@ -182,9 +191,15 @@ function parseSSEEvent(block: string): void {
 
   if (eventType === 'new_job' && dataStr) {
     try {
-      const job = JSON.parse(dataStr) as { id: string; order_id: string; order: unknown; render?: RenderedComanda[] }
+      const job = JSON.parse(dataStr) as {
+        id: string
+        order_id: string
+        order: unknown
+        render?: RenderedComanda[]
+        resolved_columns?: number
+      }
       log.info(`SSE: Received new job event ${job.id}`)
-      addToQueue(job.id, job.order_id, job.order as Parameters<typeof addToQueue>[2], job.render)
+      addToQueue(job.id, job.order_id, job.order as Parameters<typeof addToQueue>[2], job.render, job.resolved_columns)
     } catch (e) {
       log.error('Failed to parse new_job event data:', e)
     }

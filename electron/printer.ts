@@ -24,6 +24,7 @@ import { join } from 'path'
 import { createLogger } from './logger'
 import { getConfig } from './store'
 import { ZUPPY_APP_URL } from './config'
+import { layoutTwoColumns, wrapText, doubleWidthColumns } from './text-layout'
 
 const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
@@ -133,6 +134,22 @@ function paperWidthMm(): 80 | 58 {
 }
 
 /**
+ * Largura em colunas da ESTAÇÃO local: usa a calibração explícita do usuário
+ * (`cfg.columns`, ver AppConfig em store.ts) quando existir; senão deriva da
+ * largura física do papel com a MESMA matemática de `createPrinter`
+ * (58mm→32, 80mm→48). É a fonte única de verdade sobre "quantas colunas esta
+ * impressora imprime de verdade" — usada pelo cutover de print-queue.ts para
+ * decidir entre os bytes já renderizados pelo servidor e o build local.
+ */
+export function stationColumns(): number {
+  const cfg = getConfig()
+  if (typeof cfg.columns === 'number' && Number.isFinite(cfg.columns) && cfg.columns > 0) {
+    return Math.floor(cfg.columns)
+  }
+  return paperWidthMm() === 58 ? 32 : 48
+}
+
+/**
  * Cria um ThermalPrinter só pra MONTAR o buffer ESC/POS (getBuffer). A
  * interface `tcp://` é dummy e nunca é usada — nunca chamamos execute(); a
  * impressão real vai pelo spooler RAW do Windows (sendRawToWindowsPrinter).
@@ -189,6 +206,57 @@ function buildNavUrl(order: OrderData): string | null {
   return `${ZUPPY_APP_URL.replace(/\/+$/, '')}/nav?to=${encodeURIComponent(navDest)}`
 }
 
+/**
+ * Imprime um par esquerda/direita (item + preço, TOTAL + valor etc.) sem
+ * nunca exceder a largura do papel nem cortar o valor da direita no meio.
+ * Substitui `printer.tableCustom()`: ver electron/text-layout.ts para o
+ * porquê (a lib nativa arredonda a largura da coluna PRA CIMA e trunca
+ * texto que não cabe via `.substring()`).
+ */
+function printTwoColumns(
+  printer: ThermalPrinter,
+  left: string,
+  right: string,
+): void {
+  for (const line of layoutTwoColumns(left, right, printer.getWidth())) {
+    printer.println(line)
+  }
+}
+
+/**
+ * Imprime um cabeçalho em tamanho dobrado (`setTextSize(1, 1)`) descontando
+ * a largura dupla por caractere. Sem isso, nomes de loja/textos maiores que
+ * `floor(columns/2)` saem partidos ao meio pela própria impressora — foto
+ * real: "Pastel dos Amigos" (17 chars, 58mm/16 colunas dobradas) virou
+ * "Pastel dos Amig" + "os". Assume que `printer.setTextSize(1, 1)` já foi
+ * chamado pelo chamador (e será desfeito por ele depois).
+ */
+function printDoubleWidthLine(printer: ThermalPrinter, text: string): void {
+  const columns = doubleWidthColumns(printer.getWidth())
+  for (const line of wrapText(text, columns)) {
+    printer.println(line)
+  }
+}
+
+/**
+ * Reset explícito de estado no início de CADA documento (fonte normal, sem
+ * negrito, sem tamanho dobrado, alinhado à esquerda).
+ *
+ * `printOrder` cria uma instância nova de ThermalPrinter por ticket, mas
+ * isso só zera o BUFFER em memória — o `cut()` do ticket anterior é quem
+ * reseta o HARDWARE físico (chama initHardware() depois de cortar). Se o
+ * ticket anterior falhar antes do cut(), ou se outro processo tiver deixado
+ * a impressora em outro estado, o próximo documento herdaria negrito/tamanho
+ * dobrado/alinhamento residual. Este reset no início torna o início de cada
+ * documento determinístico, para que a via da cozinha nunca contamine a da
+ * entrega nem vice-versa.
+ */
+function resetDocumentState(printer: ThermalPrinter): void {
+  printer.setTextNormal()
+  printer.bold(false)
+  printer.alignLeft()
+}
+
 // ─── ESC/POS Ticket Builders ──────────────────────────────────────────────────
 
 /**
@@ -198,10 +266,12 @@ export async function buildKitchenTicketBytes(
   printer: ThermalPrinter,
   order: OrderData,
 ): Promise<void> {
+  resetDocumentState(printer)
+
   printer.alignCenter()
   printer.bold(true)
   printer.setTextSize(1, 1)
-  printer.println('*** COZINHA ***')
+  printDoubleWidthLine(printer, '*** COZINHA ***')
   printer.setTextNormal()
   printer.bold(false)
   printer.drawLine()
@@ -255,7 +325,7 @@ export async function buildKitchenTicketBytes(
     printer.alignCenter()
     printer.bold(true)
     printer.setTextSize(1, 1)
-    printer.println(`RETIRADA: ${order.pickup_code}`)
+    printDoubleWidthLine(printer, `RETIRADA: ${order.pickup_code}`)
     printer.setTextNormal()
     printer.bold(false)
   } else if (order.customer_address) {
@@ -281,10 +351,12 @@ export async function buildOperationalTicketBytes(
 ): Promise<void> {
   const cfg = getConfig()
 
+  resetDocumentState(printer)
+
   printer.alignCenter()
   printer.bold(true)
   printer.setTextSize(1, 1)
-  printer.println(cfg.tenant_name ?? 'Zuppy Food')
+  printDoubleWidthLine(printer, cfg.tenant_name ?? 'Zuppy Food')
   printer.setTextNormal()
   printer.bold(false)
   printer.println('Comprovante do Pedido')
@@ -310,17 +382,11 @@ export async function buildOperationalTicketBytes(
       ? `${item.product_name} / ${item.half_product_name}`
       : item.product_name
 
-    printer.tableCustom([
-      { text: `${item.quantity}x ${name}`, align: 'LEFT', width: 0.65 },
-      { text: brl(item.subtotal), align: 'RIGHT', width: 0.35 },
-    ])
+    printTwoColumns(printer, `${item.quantity}x ${name}`, brl(item.subtotal))
 
     if (item.addons && item.addons.length > 0) {
       for (const addon of item.addons) {
-        printer.tableCustom([
-          { text: `  + ${addon.name}`, align: 'LEFT', width: 0.65 },
-          { text: brl(addon.price), align: 'RIGHT', width: 0.35 },
-        ])
+        printTwoColumns(printer, `  + ${addon.name}`, brl(addon.price))
       }
     }
 
@@ -336,39 +402,31 @@ export async function buildOperationalTicketBytes(
   printer.drawLine()
 
   // Totals
-  printer.tableCustom([
-    { text: 'Subtotal:', align: 'LEFT', width: 0.6 },
-    { text: brl(order.subtotal), align: 'RIGHT', width: 0.4 },
-  ])
+  printTwoColumns(printer, 'Subtotal:', brl(order.subtotal))
 
   if (order.delivery_fee > 0) {
-    printer.tableCustom([
-      { text: 'Taxa de entrega:', align: 'LEFT', width: 0.6 },
-      { text: brl(order.delivery_fee), align: 'RIGHT', width: 0.4 },
-    ])
+    printTwoColumns(printer, 'Taxa de entrega:', brl(order.delivery_fee))
   }
 
   if (order.discount > 0) {
-    printer.tableCustom([
-      { text: 'Desconto:', align: 'LEFT', width: 0.6 },
-      { text: `-${brl(order.discount)}`, align: 'RIGHT', width: 0.4 },
-    ])
+    printTwoColumns(printer, 'Desconto:', `-${brl(order.discount)}`)
   }
 
   printer.bold(true)
-  printer.tableCustom([
-    { text: 'TOTAL:', align: 'LEFT', width: 0.6 },
-    { text: brl(order.total), align: 'RIGHT', width: 0.4 },
-  ])
+  printTwoColumns(printer, 'TOTAL:', brl(order.total))
   printer.bold(false)
   printer.drawLine()
 
   // Payment
   printer.println(`Pagamento: ${paymentLabel(order.payment_method)}`)
   if (order.payment_method === 'cash' && order.change_for) {
-    printer.println(`Troco para: ${brl(order.change_for)}`)
+    // printTwoColumns (não println cru): o print() da lib refaz o fold
+    // quebrando no último espaço, o que já separou "R$" do valor numa linha
+    // e o resto na seguinte. printTwoColumns mantém o par rótulo/valor numa
+    // única linha (ou desce o valor inteiro, nunca cortado).
+    printTwoColumns(printer, 'Troco para:', brl(order.change_for))
     const change = order.change_for - order.total
-    printer.println(`Troco: ${brl(change > 0 ? change : 0)}`)
+    printTwoColumns(printer, 'Troco:', brl(change > 0 ? change : 0))
   }
   printer.drawLine()
 
