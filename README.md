@@ -53,7 +53,7 @@ impressora-zuppy/
 │   ├── main.ts          # Main process (ponto de entrada)
 │   ├── preload.ts       # Bridge renderer ↔ main (contextBridge)
 │   ├── http-server.ts   # Express em localhost:7847
-│   ├── realtime.ts      # Supabase Realtime listener
+│   ├── realtime.ts      # Polling de print jobs na API do Zuppy
 │   ├── print-queue.ts   # Fila de impressão com retry
 │   ├── printer.ts       # ESC/POS via node-thermal-printer
 │   ├── tray.ts          # Ícone na bandeja do sistema
