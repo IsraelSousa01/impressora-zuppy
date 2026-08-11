@@ -3,7 +3,7 @@
  * Constantes compartilhadas do processo main.
  *
  * ZUPPY_APP_URL: base da API do Zuppy que o app consome
- * (/api/printer/auth, /jobs, /jobs/stream, /orders/[id], /jobs/[id]/confirm).
+ * (/api/printer/auth, /jobs, /orders/[id], /jobs/[id]/confirm).
  *
  * USA `www.` DE PROPÓSITO: o apex `zuppyfood.com.br` faz 307-redirect pra
  * `www.zuppyfood.com.br`, e numa redireção ENTRE HOSTS o fetch descarta o

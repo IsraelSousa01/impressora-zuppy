@@ -7,7 +7,7 @@
  *  2. Auto-start with Windows (Login Items)
  *  3. System tray icon (Pure headless - no settings window)
  *  4. HTTP server on localhost:7847
- *  5. Connection to Zuppy SSE stream
+ *  5. Polling de print jobs na API do Zuppy
  *  6. Print queue crash-recovery
  *  7. Auto-updater
  */
@@ -155,9 +155,9 @@ app.on('second-instance', () => {
   log.info('Second instance detected - app is already running in tray')
 })
 
-app.on('window-all-closed', (e: Event) => {
-  // Keep running in the tray even if any dummy windows are closed
-  e.preventDefault()
+app.on('window-all-closed', () => {
+  // Keep running in the tray even if any dummy windows are closed — a simples
+  // presença deste listener (sem chamar app.quit()) impede o encerramento.
 })
 
 app.on('before-quit', async () => {
@@ -190,9 +190,9 @@ app.whenReady().then(async () => {
     restoreQueue(pendingIds)
   }
 
-  // Connect to Zuppy SSE stream if already configured
+  // Start polling Zuppy for print jobs if already configured
   if (isConfigured()) {
-    connect().catch((err) => log.error('Initial SSE connection failed', err))
+    connect().catch((err) => log.error('Initial polling connection failed', err))
   } else {
     log.info('App not yet configured – waiting for POST /configure')
   }
