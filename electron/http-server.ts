@@ -8,6 +8,7 @@
  *   POST /configure       → save config and (re)connect realtime
  *   GET  /printers        → list Windows printers
  *   POST /test-print      → print a test page
+ *   POST /print-raw       → print a ready-made ESC/POS document (base64)
  *
  * Security:
  *   - Binds to 127.0.0.1 only (never 0.0.0.0)
@@ -21,7 +22,7 @@ import { app as electronApp } from 'electron'
 import { getConfig, setConfig, isConfigured, getLogs } from './store'
 import { getConnectionStatus, connect, disconnect } from './realtime'
 import { getQueueStatus } from './print-queue'
-import { listPrinters, testPrint } from './printer'
+import { listPrinters, testPrint, printRawDocument } from './printer'
 import { createLogger } from './logger'
 
 const log = createLogger('HTTP')
@@ -55,6 +56,69 @@ const corsOptions: cors.CorsOptions = {
   methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
+}
+
+// ─── /print-raw validation ────────────────────────────────────────────────────
+
+/**
+ * Teto do documento DECODIFICADO aceito pelo /print-raw: 64 KB.
+ *
+ * Por quê 64 KB: a folha de calibração do painel e uma comanda renderizada
+ * pelo servidor têm poucos KB (texto ESC/POS a 48 colunas ≈ 50 bytes/linha);
+ * 64 KB dá folga de sobra para QR/conteúdo raster moderado, mas é um teto
+ * duro contra documento gigante — 64 KB de texto seriam ~1300 linhas
+ * (~5 m de papel), o suficiente pra travar a impressora e esvaziar a bobina.
+ * O limite de 1 MB do body JSON protege o processo, não o papel; este aqui
+ * protege a impressora.
+ */
+export const PRINT_RAW_MAX_DECODED_BYTES = 64 * 1024
+
+/** ESC @ — init ESC/POS. Todo documento legítimo do Zuppy começa assim. */
+const ESC_POS_INIT = [0x1b, 0x40] as const
+
+/**
+ * Alfabeto base64 estrito (com padding `=` só no fim). Validado ANTES do
+ * decode porque `Buffer.from(s, 'base64')` é leniente: ignora caracteres
+ * inválidos em silêncio, e lixo viraria bytes imprevisíveis na impressora.
+ */
+const BASE64_STRICT = /^[A-Za-z0-9+/]+={0,2}$/
+
+export type PrintRawValidation =
+  | { ok: true; bytes: Buffer }
+  | { ok: false; error: string }
+
+/**
+ * Valida o `bytes_base64` do POST /print-raw como entrada NÃO confiável:
+ * string base64 estrita → teto de tamanho decodificado → precisa começar
+ * com ESC @ (0x1B 0x40). Só devolve bytes prontos pra impressora se as
+ * três barreiras passarem.
+ */
+export function validatePrintRawDocument(bytesBase64: unknown): PrintRawValidation {
+  if (typeof bytesBase64 !== 'string' || bytesBase64.length === 0) {
+    return { ok: false, error: 'Missing required field: bytes_base64 (base64 string)' }
+  }
+
+  if (bytesBase64.length % 4 !== 0 || !BASE64_STRICT.test(bytesBase64)) {
+    return { ok: false, error: 'bytes_base64 is not valid base64' }
+  }
+
+  const bytes = Buffer.from(bytesBase64, 'base64')
+
+  if (bytes.length > PRINT_RAW_MAX_DECODED_BYTES) {
+    return {
+      ok: false,
+      error: `Document too large: ${bytes.length} bytes (max ${PRINT_RAW_MAX_DECODED_BYTES})`,
+    }
+  }
+
+  if (bytes.length < ESC_POS_INIT.length || bytes[0] !== ESC_POS_INIT[0] || bytes[1] !== ESC_POS_INIT[1]) {
+    return {
+      ok: false,
+      error: 'Document must start with ESC/POS init (0x1B 0x40)',
+    }
+  }
+
+  return { ok: true, bytes }
 }
 
 // ─── Router ───────────────────────────────────────────────────────────────────
@@ -188,6 +252,49 @@ function buildRouter() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       log.error('Test print failed', err)
+      res.status(500).json({ error: message })
+    }
+  })
+
+  /**
+   * POST /print-raw
+   * Imprime um documento ESC/POS já pronto (ex.: folha de calibração de
+   * largura do painel do Zuppy — não é comanda de pedido, então não passa
+   * pela fila de print_jobs). Body: { bytes_base64, printer_name? }.
+   */
+  router.post('/print-raw', async (req: Request, res: Response) => {
+    const { bytes_base64, printer_name } = req.body as {
+      bytes_base64?: unknown
+      printer_name?: unknown
+    }
+
+    // printer_name vai direto como argumento de processo (spooler via
+    // PowerShell) — só aceita string.
+    if (printer_name !== undefined && typeof printer_name !== 'string') {
+      res.status(400).json({ error: 'printer_name must be a string' })
+      return
+    }
+
+    const cfg = getConfig()
+    const target = printer_name ?? cfg.printer_name
+
+    if (!target) {
+      res.status(400).json({ error: 'No printer specified or configured' })
+      return
+    }
+
+    const validation = validatePrintRawDocument(bytes_base64)
+    if (!validation.ok) {
+      res.status(400).json({ error: validation.error })
+      return
+    }
+
+    try {
+      await printRawDocument(target, validation.bytes)
+      res.json({ ok: true, printer: target })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      log.error('Raw print failed', err)
       res.status(500).json({ error: message })
     }
   })
