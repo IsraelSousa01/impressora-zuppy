@@ -6,6 +6,7 @@
  *  - listPrinters()        → available Windows printer names
  *  - testPrint()           → prints a simple test page
  *  - printOrder()          → prints kitchen + operational tickets for an order
+ *  - printRawDocument()    → sends a ready-made ESC/POS document (raw bytes)
  *  - buildKitchenTicketBytes()    → ESC/POS bytes for kitchen (no prices)
  *  - buildOperationalTicketBytes() → ESC/POS bytes for full ticket with prices
  */
@@ -566,6 +567,25 @@ export async function printRenderedComandas(
     throw new Error('render[] presente mas nada imprimivel (bytes vazios/invalidos)')
   }
   log.info(`Pre-rendered comandas printed (${sent} impressao(oes))`)
+}
+
+/**
+ * Imprime um documento ESC/POS JÁ PRONTO (bytes crus) — caminho do
+ * POST /print-raw (ex.: folha de calibração de largura gerada pelo painel
+ * do Zuppy). Usa o MESMO transporte RAW das comandas renderizadas pelo
+ * servidor; a validação do documento (base64, tamanho, init ESC/POS) é
+ * responsabilidade do chamador (http-server.ts).
+ *
+ * @param printerName - Windows printer name
+ * @param bytes       - Documento ESC/POS completo, já decodificado
+ */
+export async function printRawDocument(
+  printerName: string,
+  bytes: Buffer,
+): Promise<void> {
+  log.info(`Printing raw document (${bytes.length} bytes) on "${printerName}"`)
+  await sendRawToWindowsPrinter(printerName, bytes)
+  log.info('Raw document printed')
 }
 
 /**
