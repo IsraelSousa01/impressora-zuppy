@@ -23,7 +23,8 @@
 
 import { EventEmitter } from 'events'
 import { getConfig, setConfig, isConfigured } from './store'
-import { addToQueue } from './print-queue'
+import { addToQueue, getQueueStatus } from './print-queue'
+import { maybeInstallOnSafeWindow, isStoreClosedPollInterval } from './updater'
 import type { RenderedComanda } from './printer'
 import { createLogger } from './logger'
 import { ZUPPY_APP_URL } from './config'
@@ -252,6 +253,23 @@ function scheduleNextPoll(generation: number, delayMs: number): void {
 }
 
 /**
+ * Pós-tick OK: entrega ao updater os sinais da janela segura de instalação
+ * (loja fechada = ritmo de poll de loja fechada ditado pelo servidor; fila
+ * local vazia). Blindado de propósito: uma falha do updater NUNCA pode
+ * derrubar o polling que imprime pedidos reais.
+ */
+function reportUpdateSafeWindowSignals(): void {
+  try {
+    maybeInstallOnSafeWindow({
+      storeClosed: isStoreClosedPollInterval(currentPollIntervalMs),
+      queueEmpty: getQueueStatus().length === 0,
+    })
+  } catch (err) {
+    log.error('Updater signal error (ignorado):', err instanceof Error ? err.message : String(err))
+  }
+}
+
+/**
  * Falha de um tick: agenda retry (backoff exponencial, ou o delay explícito
  * de um Retry-After) e emite 'disconnected' só quando a falha persiste.
  */
@@ -316,6 +334,8 @@ async function pollTick(generation: number): Promise<void> {
         realtimeEvents.emit('connected')
       }
       scheduleNextPoll(generation, currentPollIntervalMs)
+      // Depois de já ter agendado o próximo tick: nada aqui afeta o loop.
+      reportUpdateSafeWindowSignals()
       return
     case 'unauthorized':
       // Sessão expirada/revogada: zera e re-autentica no próximo tick.

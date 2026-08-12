@@ -20,6 +20,7 @@ import { loadPendingQueue } from './store'
 import { startHttpServer, stopHttpServer } from './http-server'
 import { connect, disconnect } from './realtime'
 import { restoreQueue, getQueueStatus } from './print-queue'
+import { registerDownloadedUpdate } from './updater'
 import { listPrinters, testPrint } from './printer'
 import { createTray, updateTray, destroyTray } from './tray'
 import { createLogger } from './logger'
@@ -121,6 +122,12 @@ function setupAutoUpdater(): void {
 
   autoUpdater.on('update-downloaded', (info) => {
     log.info('Update downloaded', info)
+    // Registra no updater.ts: o app roda 24/7 (auto-start, lojista nunca
+    // fecha), então autoInstallOnAppQuit sozinho deixaria o instalador
+    // parado no disco pra sempre. A instalação acontece na janela segura
+    // (loja fechada + fila vazia — ver maybeInstallOnSafeWindow) ou sob
+    // demanda pelo painel (POST /install-update).
+    registerDownloadedUpdate(info.version)
   })
 
   autoUpdater.on('error', (err) => {

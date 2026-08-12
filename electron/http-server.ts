@@ -9,6 +9,7 @@
  *   GET  /printers        → list Windows printers
  *   POST /test-print      → print a test page
  *   POST /print-raw       → print a ready-made ESC/POS document (base64)
+ *   POST /install-update  → install a downloaded update on demand (panel button)
  *
  * Security:
  *   - Binds to 127.0.0.1 only (never 0.0.0.0)
@@ -22,6 +23,7 @@ import { app as electronApp } from 'electron'
 import { getConfig, setConfig, isConfigured, getLogs } from './store'
 import { getConnectionStatus, connect, disconnect } from './realtime'
 import { getQueueStatus } from './print-queue'
+import { getUpdateState, installNow } from './updater'
 import { listPrinters, testPrint, printRawDocument } from './printer'
 import { createLogger } from './logger'
 
@@ -151,6 +153,10 @@ function buildRouter() {
       tenant_name: cfg.tenant_name ?? null,
       tenant_id: cfg.tenant_id ?? null,
       connected: getConnectionStatus(),
+      // Update baixado aguardando janela segura (loja fechada + fila vazia).
+      // `downloadedAt` deixa o painel detectar "esperando há muito tempo" e
+      // oferecer o botão de instalar agora (POST /install-update).
+      update: getUpdateState(),
     })
   })
 
@@ -297,6 +303,41 @@ function buildRouter() {
       log.error('Raw print failed', err)
       res.status(500).json({ error: message })
     }
+  })
+
+  /**
+   * POST /install-update
+   * Instala AGORA um update já baixado — o botão "atualizar" do painel.
+   * É a única exceção à regra de "nunca instalar com a loja aberta": aqui é
+   * ato explícito do lojista, não decisão automática. Body: { confirm: true }
+   * obrigatório — o restart derruba a impressão por alguns segundos, então
+   * nenhum GET perdido ou POST vazio pode disparar isso por acidente.
+   */
+  router.post('/install-update', (req: Request, res: Response) => {
+    const { confirm } = req.body as { confirm?: unknown }
+
+    if (confirm !== true) {
+      res.status(400).json({ error: 'Missing required field: confirm (must be true)' })
+      return
+    }
+
+    const update = getUpdateState()
+    if (!update.updateReady) {
+      res.status(409).json({ error: 'No update downloaded yet' })
+      return
+    }
+
+    // Responde ANTES de instalar: quitAndInstall encerra o processo e a
+    // resposta se perderia. O painel confirma pelo /status pós-restart.
+    res.json({ ok: true, version: update.version })
+
+    setImmediate(() => {
+      installNow()
+        .then((result) => {
+          if (!result.ok) log.error(`On-demand install failed: ${result.error}`)
+        })
+        .catch((err) => log.error('On-demand install threw', err))
+    })
   })
 
   return router
