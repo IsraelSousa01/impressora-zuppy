@@ -17,68 +17,374 @@ import {
   CharacterSet,
   BreakLine,
 } from 'node-thermal-printer'
-import { exec, execFile } from 'child_process'
+import { exec, spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 import { promisify } from 'util'
-import { writeFile, unlink } from 'fs/promises'
-import { tmpdir } from 'os'
-import { join } from 'path'
 import { createLogger } from './logger'
 import { getConfig } from './store'
 import { ZUPPY_APP_URL } from './config'
 import { layoutTwoColumns, wrapText, doubleWidthColumns } from './text-layout'
 
 const execAsync = promisify(exec)
-const execFileAsync = promisify(execFile)
 const log = createLogger('PRINTER')
 
 /**
- * Impressão RAW no Windows SEM módulo nativo.
+ * Impressão RAW no Windows SEM módulo nativo — via worker PowerShell PERSISTENTE.
  *
  * O node-thermal-printer, pra falar com a impressora do Windows, exige o módulo
  * nativo `@thiagoelg/node-printer`, que precisa compilar com Visual Studio Build
  * Tools — a máquina da loja não tem. Então montamos a comanda com o
  * node-thermal-printer (getBuffer) e mandamos os bytes ESC/POS pro spooler do
- * Windows via winspool.drv, chamado de dentro de um PowerShell (P/Invoke C#).
+ * Windows via winspool.drv, chamado por P/Invoke C# dentro de um PowerShell.
  *
- * O script vai em base64 pra não sofrer com escaping (here-string + aspas).
+ * Até a 1.1.0 cada impressão iniciava um powershell.exe NOVO (+2 arquivos
+ * temporários) e recompilava o C# com Add-Type — medido na máquina da loja:
+ * ~840ms de start do powershell + ~660ms de Add-Type = ~1,5s de overhead POR
+ * comanda, parte relevante do piso de 2,4s da latência fim-a-fim. Agora um
+ * único worker fica vivo: compila o C# UMA vez no boot, responde 'READY' e
+ * entra num loop lendo uma requisição por linha no stdin e respondendo uma
+ * linha no stdout. Sem arquivo temporário: impressora e bytes viajam em
+ * base64 na própria linha (linhas 100% ASCII — imune a codepage do console).
+ *
+ * Protocolo (1 linha por mensagem, campos separados por TAB):
+ *   requisição → `<id>\t<printerName utf8→b64>\t<bytes b64>`
+ *   resposta   → `<id>\tOK\t<qtde bytes>`  |  `<id>\tERR\t<mensagem utf8→b64>`
+ *
+ * Garantias:
+ *  - NUNCA responde OK sem o spooler ter aceitado o documento: o OK só sai
+ *    depois de ZuppyRawPrinter.Send() retornar; qualquer falha de
+ *    OpenPrinter/StartDoc/WritePrinter lança e vira ERR (caller falha alto).
+ *  - Recuperação: worker morto (crash, kill, reciclagem do Windows) é
+ *    detectado pelo evento 'exit'; o próximo envio faz respawn sob demanda.
+ *  - Timeout por requisição: impressão pendurada derruba o worker e rejeita
+ *    (a fila faz o retry) — nada fica pendurado pra sempre.
+ *  - Sem vazamento: `process.on('exit')` mata o worker; e se o app morrer
+ *    sem evento (crash duro), o stdin do worker fecha (EOF) e o loop de
+ *    ReadLine termina sozinho.
+ *
+ * ATENÇÃO ao editar o script: é um template literal SEM interpolação — não
+ * use crase (escape do PowerShell) nem `${` (interpolação JS) dentro dele.
+ * O teste de invariantes em printer-worker.test.ts vigia isso.
  */
-const RAW_PRINT_PS1_B64 =
-  'cGFyYW0oCiAgW1BhcmFtZXRlcihNYW5kYXRvcnk9JHRydWUpXVtzdHJpbmddJFByaW50ZXJOYW1lLAogIFtQYXJhbWV0ZXIoTWFuZGF0b3J5PSR0cnVlKV1bc3RyaW5nXSREYXRhRmlsZQopCiRFcnJvckFjdGlvblByZWZlcmVuY2UgPSAnU3RvcCcKCkFkZC1UeXBlIC1UeXBlRGVmaW5pdGlvbiBAJwp1c2luZyBTeXN0ZW07CnVzaW5nIFN5c3RlbS5SdW50aW1lLkludGVyb3BTZXJ2aWNlczsKcHVibGljIGNsYXNzIFp1cHB5UmF3UHJpbnRlciB7CiAgW1N0cnVjdExheW91dChMYXlvdXRLaW5kLlNlcXVlbnRpYWwsIENoYXJTZXQ9Q2hhclNldC5Vbmljb2RlKV0KICBwdWJsaWMgc3RydWN0IERPQ0lORk8gewogICAgW01hcnNoYWxBcyhVbm1hbmFnZWRUeXBlLkxQV1N0cildIHB1YmxpYyBzdHJpbmcgcERvY05hbWU7CiAgICBbTWFyc2hhbEFzKFVubWFuYWdlZFR5cGUuTFBXU3RyKV0gcHVibGljIHN0cmluZyBwT3V0cHV0RmlsZTsKICAgIFtNYXJzaGFsQXMoVW5tYW5hZ2VkVHlwZS5MUFdTdHIpXSBwdWJsaWMgc3RyaW5nIHBEYXRhVHlwZTsKICB9CiAgW0RsbEltcG9ydCgid2luc3Bvb2wuZHJ2IiwgQ2hhclNldD1DaGFyU2V0LlVuaWNvZGUsIFNldExhc3RFcnJvcj10cnVlKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBPcGVuUHJpbnRlcihzdHJpbmcgc3JjLCBvdXQgSW50UHRyIGhQcmludGVyLCBJbnRQdHIgcGQpOwogIFtEbGxJbXBvcnQoIndpbnNwb29sLmRydiIsIFNldExhc3RFcnJvcj10cnVlKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBDbG9zZVByaW50ZXIoSW50UHRyIGhQcmludGVyKTsKICBbRGxsSW1wb3J0KCJ3aW5zcG9vbC5kcnYiLCBDaGFyU2V0PUNoYXJTZXQuVW5pY29kZSwgU2V0TGFzdEVycm9yPXRydWUpXSBwdWJsaWMgc3RhdGljIGV4dGVybiBib29sIFN0YXJ0RG9jUHJpbnRlcihJbnRQdHIgaFByaW50ZXIsIGludCBsZXZlbCwgcmVmIERPQ0lORk8gZGkpOwogIFtEbGxJbXBvcnQoIndpbnNwb29sLmRydiIsIFNldExhc3RFcnJvcj10cnVlKV0gcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBFbmREb2NQcmludGVyKEludFB0ciBoUHJpbnRlcik7CiAgW0RsbEltcG9ydCgid2luc3Bvb2wuZHJ2IiwgU2V0TGFzdEVycm9yPXRydWUpXSBwdWJsaWMgc3RhdGljIGV4dGVybiBib29sIFN0YXJ0UGFnZVByaW50ZXIoSW50UHRyIGhQcmludGVyKTsKICBbRGxsSW1wb3J0KCJ3aW5zcG9vbC5kcnYiLCBTZXRMYXN0RXJyb3I9dHJ1ZSldIHB1YmxpYyBzdGF0aWMgZXh0ZXJuIGJvb2wgRW5kUGFnZVByaW50ZXIoSW50UHRyIGhQcmludGVyKTsKICBbRGxsSW1wb3J0KCJ3aW5zcG9vbC5kcnYiLCBTZXRMYXN0RXJyb3I9dHJ1ZSldIHB1YmxpYyBzdGF0aWMgZXh0ZXJuIGJvb2wgV3JpdGVQcmludGVyKEludFB0ciBoUHJpbnRlciwgYnl0ZVtdIHBCeXRlcywgaW50IGR3Q291bnQsIG91dCBpbnQgZHdXcml0dGVuKTsKICBwdWJsaWMgc3RhdGljIHZvaWQgU2VuZChzdHJpbmcgcHJpbnRlciwgYnl0ZVtdIGJ5dGVzKSB7CiAgICBJbnRQdHIgaDsKICAgIGlmICghT3BlblByaW50ZXIocHJpbnRlciwgb3V0IGgsIEludFB0ci5aZXJvKSkgdGhyb3cgbmV3IEV4Y2VwdGlvbigiT3BlblByaW50ZXIgZmFsaG91IChlcnI9IiArIE1hcnNoYWwuR2V0TGFzdFdpbjMyRXJyb3IoKSArICIpIik7CiAgICB0cnkgewogICAgICBET0NJTkZPIGRpID0gbmV3IERPQ0lORk8oKTsgZGkucERvY05hbWUgPSAiWnVwcHkgQ29tYW5kYSI7IGRpLnBEYXRhVHlwZSA9ICJSQVciOwogICAgICBpZiAoIVN0YXJ0RG9jUHJpbnRlcihoLCAxLCByZWYgZGkpKSB0aHJvdyBuZXcgRXhjZXB0aW9uKCJTdGFydERvY1ByaW50ZXIgZmFsaG91IGVycj0iICsgTWFyc2hhbC5HZXRMYXN0V2luMzJFcnJvcigpKTsKICAgICAgdHJ5IHsKICAgICAgICBTdGFydFBhZ2VQcmludGVyKGgpOwogICAgICAgIGludCB3cml0dGVuOwogICAgICAgIGlmICghV3JpdGVQcmludGVyKGgsIGJ5dGVzLCBieXRlcy5MZW5ndGgsIG91dCB3cml0dGVuKSkgdGhyb3cgbmV3IEV4Y2VwdGlvbigiV3JpdGVQcmludGVyIGZhbGhvdSBlcnI9IiArIE1hcnNoYWwuR2V0TGFzdFdpbjMyRXJyb3IoKSk7CiAgICAgICAgRW5kUGFnZVByaW50ZXIoaCk7CiAgICAgIH0gZmluYWxseSB7IEVuZERvY1ByaW50ZXIoaCk7IH0KICAgIH0gZmluYWxseSB7IENsb3NlUHJpbnRlcihoKTsgfQogIH0KfQonQAoKJGJ5dGVzID0gW1N5c3RlbS5JTy5GaWxlXTo6UmVhZEFsbEJ5dGVzKCREYXRhRmlsZSkKW1p1cHB5UmF3UHJpbnRlcl06OlNlbmQoJFByaW50ZXJOYW1lLCAkYnl0ZXMpCldyaXRlLU91dHB1dCAoIk9LOiAiICsgJGJ5dGVzLkxlbmd0aCArICIgYnl0ZXMgLT4gJyIgKyAkUHJpbnRlck5hbWUgKyAiJyIpCg=='
+export const PRINT_WORKER_PS_SOURCE = `
+$ErrorActionPreference = 'Stop'
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class ZuppyRawPrinter {
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct DOCINFO {
+    [MarshalAs(UnmanagedType.LPWStr)] public string pDocName;
+    [MarshalAs(UnmanagedType.LPWStr)] public string pOutputFile;
+    [MarshalAs(UnmanagedType.LPWStr)] public string pDataType;
+  }
+  [DllImport("winspool.drv", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool OpenPrinter(string src, out IntPtr hPrinter, IntPtr pd);
+  [DllImport("winspool.drv", SetLastError=true)] public static extern bool ClosePrinter(IntPtr hPrinter);
+  [DllImport("winspool.drv", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool StartDocPrinter(IntPtr hPrinter, int level, ref DOCINFO di);
+  [DllImport("winspool.drv", SetLastError=true)] public static extern bool EndDocPrinter(IntPtr hPrinter);
+  [DllImport("winspool.drv", SetLastError=true)] public static extern bool StartPagePrinter(IntPtr hPrinter);
+  [DllImport("winspool.drv", SetLastError=true)] public static extern bool EndPagePrinter(IntPtr hPrinter);
+  [DllImport("winspool.drv", SetLastError=true)] public static extern bool WritePrinter(IntPtr hPrinter, byte[] pBytes, int dwCount, out int dwWritten);
+  public static void Send(string printer, byte[] bytes) {
+    IntPtr h;
+    if (!OpenPrinter(printer, out h, IntPtr.Zero)) throw new Exception("OpenPrinter falhou (err=" + Marshal.GetLastWin32Error() + ")");
+    try {
+      DOCINFO di = new DOCINFO(); di.pDocName = "Zuppy Comanda"; di.pDataType = "RAW";
+      if (!StartDocPrinter(h, 1, ref di)) throw new Exception("StartDocPrinter falhou err=" + Marshal.GetLastWin32Error());
+      try {
+        StartPagePrinter(h);
+        int written;
+        if (!WritePrinter(h, bytes, bytes.Length, out written)) throw new Exception("WritePrinter falhou err=" + Marshal.GetLastWin32Error());
+        EndPagePrinter(h);
+      } finally { EndDocPrinter(h); }
+    } finally { ClosePrinter(h); }
+  }
+}
+'@
+
+[Console]::Out.WriteLine('READY')
+
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  if ($line.Length -eq 0) { continue }
+  $parts = $line.Split([char]9)
+  $id = $parts[0]
+  try {
+    if ($parts.Count -ne 3) { throw 'requisicao malformada (esperado id TAB printer TAB bytes)' }
+    $printer = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1]))
+    $bytes = [Convert]::FromBase64String($parts[2])
+    [ZuppyRawPrinter]::Send($printer, $bytes)
+    [Console]::Out.WriteLine($id + [char]9 + 'OK' + [char]9 + $bytes.Length)
+  } catch {
+    $msg = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($_.Exception.Message))
+    [Console]::Out.WriteLine($id + [char]9 + 'ERR' + [char]9 + $msg)
+  }
+}
+`
+
+/** Teto de UMA impressão — o mesmo dos 20s do execFile da era one-shot. */
+const PRINT_WORKER_REQUEST_TIMEOUT_MS = 20000
+/** Teto pro worker compilar o C# e responder READY (máquina de loja lenta). */
+const PRINT_WORKER_STARTUP_TIMEOUT_MS = 30000
+
+/** Monta a linha de requisição do protocolo do worker (campos em base64 → ASCII puro). */
+export function buildPrintWorkerRequestLine(
+  id: string,
+  printerName: string,
+  data: Buffer,
+): string {
+  return [
+    id,
+    Buffer.from(printerName, 'utf8').toString('base64'),
+    data.toString('base64'),
+  ].join('\t')
+}
+
+export type PrintWorkerResponse =
+  | { id: string; status: 'ok' }
+  | { id: string; status: 'error'; message: string }
 
 /**
- * Manda o buffer ESC/POS pra impressora do Windows via spooler RAW.
- * Escreve o script + os bytes em arquivos temporários e chama o powershell.
+ * Interpreta uma linha de resposta do worker. Linhas que não são resposta
+ * (READY, eco de lixo) retornam null — o caller decide logar.
+ */
+export function parsePrintWorkerResponseLine(line: string): PrintWorkerResponse | null {
+  const parts = line.split('\t')
+  if (parts.length < 2) return null
+  const [id, status] = parts
+  if (status === 'OK') return { id, status: 'ok' }
+  if (status === 'ERR') {
+    const message = parts[2]
+      ? Buffer.from(parts[2], 'base64').toString('utf8')
+      : 'erro desconhecido do worker de impressao'
+    return { id, status: 'error', message }
+  }
+  return null
+}
+
+interface PendingPrintRequest {
+  resolve: () => void
+  reject: (err: Error) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
+interface PrintWorkerHandle {
+  child: ChildProcessWithoutNullStreams
+  /** Resolve quando o worker respondeu READY (C# compilado, loop ativo). */
+  ready: Promise<void>
+  /** Derruba o worker e rejeita tudo que estava pendente. Idempotente. */
+  fail: (err: Error) => void
+}
+
+let printWorkerHandle: PrintWorkerHandle | null = null
+const pendingPrintRequests = new Map<string, PendingPrintRequest>()
+let nextPrintRequestId = 1
+/**
+ * Serializa os envios ao worker: a impressora física é serial e o protocolo
+ * atende uma requisição por vez. A fila (print-queue.ts) já é serial, mas
+ * test-print/print-raw do http-server chegam por fora dela.
+ */
+let printSendChain: Promise<void> = Promise.resolve()
+
+function rejectAllPendingPrintRequests(err: Error): void {
+  for (const pending of pendingPrintRequests.values()) {
+    clearTimeout(pending.timer)
+    pending.reject(err)
+  }
+  pendingPrintRequests.clear()
+}
+
+/** Retorna o worker vivo ou faz o spawn de um novo (respawn sob demanda). */
+function ensurePrintWorker(): PrintWorkerHandle {
+  if (printWorkerHandle) return printWorkerHandle
+
+  log.info('Iniciando worker PowerShell de impressão…')
+  const child = spawn(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      // -EncodedCommand (base64 de UTF-16LE): sem arquivo .ps1 temporário e
+      // sem qualquer escaping de shell.
+      '-EncodedCommand',
+      Buffer.from(PRINT_WORKER_PS_SOURCE, 'utf16le').toString('base64'),
+    ],
+    { windowsHide: true },
+  )
+
+  let readySettled = false
+  let resolveReady!: () => void
+  let rejectReady!: (err: Error) => void
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
+  // Uma falha pode chegar sem ninguém aguardando `ready` naquele instante
+  // (worker morre ocioso entre comandas) — sem isto seria unhandled rejection.
+  ready.catch(() => {})
+
+  const startupTimer = setTimeout(() => {
+    handle.fail(
+      new Error(`worker de impressão não ficou pronto em ${PRINT_WORKER_STARTUP_TIMEOUT_MS}ms`),
+    )
+  }, PRINT_WORKER_STARTUP_TIMEOUT_MS)
+
+  const handle: PrintWorkerHandle = {
+    child,
+    ready,
+    fail: (err: Error) => {
+      if (printWorkerHandle === handle) printWorkerHandle = null
+      clearTimeout(startupTimer)
+      if (!readySettled) {
+        readySettled = true
+        rejectReady(err)
+      }
+      rejectAllPendingPrintRequests(err)
+      if (!child.killed) child.kill()
+    },
+  }
+
+  let stdoutBuffer = ''
+  child.stdout.setEncoding('utf8')
+  child.stdout.on('data', (chunk: string) => {
+    stdoutBuffer += chunk
+    let newlineIndex: number
+    while ((newlineIndex = stdoutBuffer.indexOf('\n')) !== -1) {
+      const line = stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, '')
+      stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1)
+      if (line.length === 0) continue
+
+      if (line === 'READY') {
+        if (!readySettled) {
+          readySettled = true
+          clearTimeout(startupTimer)
+          log.info('Worker de impressão pronto (C# compilado)')
+          resolveReady()
+        }
+        continue
+      }
+
+      const response = parsePrintWorkerResponseLine(line)
+      if (!response) {
+        log.warn(`Linha inesperada do worker de impressão: ${line}`)
+        continue
+      }
+      const pending = pendingPrintRequests.get(response.id)
+      if (!pending) {
+        log.warn(`Resposta do worker sem requisição pendente (id=${response.id})`)
+        continue
+      }
+      pendingPrintRequests.delete(response.id)
+      clearTimeout(pending.timer)
+      if (response.status === 'ok') pending.resolve()
+      else pending.reject(new Error(response.message))
+    }
+  })
+
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', (chunk: string) => {
+    const text = chunk.trim()
+    // '#< CLIXML' é o preâmbulo que o powershell SEMPRE emite no stderr
+    // quando os streams são redirecionados — ruído de boot, não erro.
+    if (text && text !== '#< CLIXML') log.warn(`Worker de impressão stderr: ${text}`)
+  })
+
+  // Sem handler, um EPIPE no stdin (worker morreu entre o check e o write)
+  // derrubaria o processo inteiro do app.
+  child.stdin.on('error', (err) => {
+    handle.fail(new Error(`stdin do worker de impressão falhou: ${err.message}`))
+  })
+  child.on('error', (err) => {
+    handle.fail(new Error(`falha ao iniciar powershell.exe: ${err.message}`))
+  })
+  child.on('exit', (code, signal) => {
+    handle.fail(
+      new Error(`worker de impressão encerrou (code=${code ?? 'null'}, signal=${signal ?? 'null'})`),
+    )
+  })
+
+  printWorkerHandle = handle
+  return handle
+}
+
+/** Uma requisição de impressão ao worker já pronto, com timeout próprio. */
+function requestPrintFromWorker(
+  handle: PrintWorkerHandle,
+  printerName: string,
+  data: Buffer,
+): Promise<void> {
+  const id = String(nextPrintRequestId++)
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      // fail() rejeita esta pendência (ainda está no Map) e derruba o worker:
+      // um PowerShell pendurado não pode atender a próxima comanda.
+      handle.fail(
+        new Error(
+          `impressão não respondeu em ${PRINT_WORKER_REQUEST_TIMEOUT_MS}ms — worker será reiniciado no próximo envio`,
+        ),
+      )
+    }, PRINT_WORKER_REQUEST_TIMEOUT_MS)
+    pendingPrintRequests.set(id, { resolve, reject, timer })
+    handle.child.stdin.write(`${buildPrintWorkerRequestLine(id, printerName, data)}\n`, (err) => {
+      if (err) {
+        handle.fail(new Error(`falha ao enviar requisição ao worker: ${err.message}`))
+      }
+    })
+  })
+}
+
+/**
+ * Manda o buffer ESC/POS pra impressora do Windows via spooler RAW, pelo
+ * worker persistente. Envios são serializados (printSendChain); a falha de um
+ * envio é repassada ao chamador mas nunca contamina o próximo da corrente.
  */
 async function sendRawToWindowsPrinter(
   printerName: string,
   data: Buffer,
 ): Promise<void> {
-  const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`
-  const binFile = join(tmpdir(), `zuppy-print-${stamp}.bin`)
-  const ps1File = join(tmpdir(), `zuppy-rawprint-${stamp}.ps1`)
-  try {
-    await writeFile(binFile, data)
-    await writeFile(ps1File, Buffer.from(RAW_PRINT_PS1_B64, 'base64'))
-    await execFileAsync(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        ps1File,
-        '-PrinterName',
-        printerName,
-        '-DataFile',
-        binFile,
-      ],
-      { timeout: 20000 },
-    )
-  } finally {
-    await unlink(binFile).catch(() => {})
-    await unlink(ps1File).catch(() => {})
-  }
+  const task = printSendChain.then(async () => {
+    let handle = ensurePrintWorker()
+    try {
+      await handle.ready
+    } catch (err) {
+      // O worker morreu antes de ficar pronto (boot falhou, ou crash entre
+      // comandas com o handle já limpo). NENHUMA requisição foi entregue,
+      // então um único respawn + nova tentativa é seguro — zero risco de
+      // imprimir duas vezes.
+      log.warn(
+        `Worker de impressão indisponível (${err instanceof Error ? err.message : String(err)}) — respawn e nova tentativa`,
+      )
+      handle = ensurePrintWorker()
+      await handle.ready
+    }
+    const startedAt = Date.now()
+    await requestPrintFromWorker(handle, printerName, data)
+    log.info(`RAW ${data.length} bytes → "${printerName}" em ${Date.now() - startedAt}ms`)
+  })
+  printSendChain = task.then(
+    () => undefined,
+    () => undefined,
+  )
+  return task
+}
+
+// Sem vazamento no shutdown: mata o worker quando o app encerra. (Cinto
+// extra: se o app morrer sem 'exit', o EOF do stdin encerra o loop do worker.)
+process.on('exit', () => {
+  printWorkerHandle?.child.kill()
+})
+
+// ─── Test-only ────────────────────────────────────────────────────────────────
+
+/** PID do worker vivo (null se não há worker). Só para testes de recuperação. */
+export function getPrintWorkerPidForTests(): number | null {
+  return printWorkerHandle?.child.pid ?? null
+}
+
+/** Derruba o worker como se tivesse crashado. Só para testes/teardown. */
+export function killPrintWorkerForTests(): void {
+  printWorkerHandle?.fail(new Error('worker derrubado pelo teste'))
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
