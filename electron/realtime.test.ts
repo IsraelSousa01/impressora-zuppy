@@ -9,13 +9,19 @@
  *   - parseRetryAfterMs: Retry-After de um 429 em segundos ou HTTP-date,
  *     com clamp pra não virar retry imediato nem congelar a impressora.
  *
- * `realtime.ts` importa `./store` (via `./print-queue`), que instancia
- * `electron-store` no topo do módulo — e `electron-store` exige rodar dentro
- * do Electron. Mocka-se o módulo aqui só pra permitir o import fora do
- * Electron (mesmo padrão de print-queue.test.ts); as funções testadas são
- * puras e não tocam o store.
+ * `realtime.ts` importa `electron` (app.getVersion no handshake de auth) e,
+ * via `./store`/`./print-queue`, o `electron-store` — ambos exigem rodar
+ * dentro do Electron. Mocka-se os dois só pra permitir o import fora do
+ * Electron (mesmo padrão de http-server.test.ts); as funções testadas são
+ * puras e não tocam nenhum deles.
  */
 import { describe, it, expect, vi } from 'vitest'
+
+vi.mock('electron', () => ({
+  app: {
+    getVersion: () => '0.0.0-test',
+  },
+}))
 
 vi.mock('electron-store', () => {
   class MockElectronStore<T extends Record<string, unknown>> {

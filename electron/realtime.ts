@@ -22,6 +22,7 @@
  */
 
 import { EventEmitter } from 'events'
+import { app } from 'electron'
 import { getConfig, setConfig, isConfigured } from './store'
 import { addToQueue, getQueueStatus } from './print-queue'
 import { maybeInstallOnSafeWindow, isStoreClosedPollInterval } from './updater'
@@ -132,6 +133,12 @@ async function authenticate(): Promise<boolean> {
       body: JSON.stringify({
         device_token: cfg.device_token,
         paper_size: cfg.paper_size,
+        // Versão do app instalada nesta loja — fonte canônica do Electron
+        // (a mesma que o /status local reporta). Campo OPCIONAL no servidor:
+        // servidor antigo simplesmente ignora. Sem isto é impossível saber
+        // quais lojas rodam versão velha (2 de 3 ficaram na 1.0.7, em
+        // streaming ~91% mais caro, sem ninguém perceber).
+        app_version: app.getVersion(),
         // `columns` só vai quando o usuário calibrou de verdade (ver
         // AppConfig.columns em store.ts) — nunca inferido a partir de
         // paper_size. Mandar um palpite como se fosse medição é o erro que
