@@ -510,6 +510,10 @@ function buildNavUrl(order: OrderData): string | null {
     ? `${order.customer_lat},${order.customer_lng}`
     : (order.customer_address ?? '')
   if (!navDest) return null
+  // O QR NÃO segue o `api_url` do pareamento de propósito: /nav é rota apex-only
+  // no Zuppy, servida só pelo domínio público. Um app pareado pelo Gestor tem
+  // api_url = gestordepedidos.zuppyfood.com.br, host que só atende /gestor* e
+  // /api/* e devolveria 404 pro entregador. O link do mapa é agnóstico de ambiente.
   return `${ZUPPY_APP_URL.replace(/\/+$/, '')}/nav?to=${encodeURIComponent(navDest)}`
 }
 

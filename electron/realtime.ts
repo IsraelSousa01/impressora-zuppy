@@ -28,7 +28,7 @@ import { addToQueue, getQueueStatus } from './print-queue'
 import { maybeInstallOnSafeWindow, isStoreClosedPollInterval } from './updater'
 import type { RenderedComanda } from './printer'
 import { createLogger } from './logger'
-import { ZUPPY_APP_URL } from './config'
+import { resolveApiBaseUrl } from './config'
 
 const log = createLogger('JOBS-POLL')
 
@@ -42,6 +42,11 @@ const MAX_POLL_INTERVAL_MS = 60000
 
 // 429: teto pro Retry-After — um header errado não pode congelar a impressora.
 const MAX_RETRY_AFTER_MS = 5 * 60 * 1000
+
+// Teto do corpo de resposta ecoado em log: o suficiente pra ver a mensagem de
+// erro da API, curto o bastante pra uma página HTML de erro não afogar o log
+// que o suporte lê no computador da loja.
+const MAX_LOGGED_BODY_CHARS = 200
 
 // 'disconnected' só depois de falhas consecutivas: com tick de ~3s, um poll
 // perdido não é queda real; piscar o status no Gestor a cada blip de rede
@@ -126,9 +131,14 @@ async function authenticate(): Promise<boolean> {
 
   try {
     log.info('Exchanging device_token for printer session_token…')
-    const url = `${ZUPPY_APP_URL}/api/printer/auth`
+    const url = `${resolveApiBaseUrl(cfg)}/api/printer/auth`
     const res = await fetch(url, {
       method: 'POST',
+      // O corpo leva o device_token: seguir um redirect reenviaria o segredo
+      // pro destino da redireção. O endpoint legítimo nunca redireciona (a
+      // base já é canonizada na gravação do pareamento) — se redirecionar,
+      // é erro, não caminho feliz.
+      redirect: 'error',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         device_token: cfg.device_token,
@@ -148,7 +158,7 @@ async function authenticate(): Promise<boolean> {
     })
 
     if (!res.ok) {
-      const errText = await res.text().catch(() => '')
+      const errText = (await res.text().catch(() => '')).slice(0, MAX_LOGGED_BODY_CHARS)
       throw new Error(`Auth API returned ${res.status}: ${errText}`)
     }
 
@@ -194,12 +204,17 @@ type PollResult =
  * ambiente do Electron). Erros de rede propagam para o caller.
  *
  * Campos novos no JSON são opcionais: o servidor evolui de forma aditiva.
+ *
+ * Recebe a base da API pronta em vez de reler o store: `getConfig()` faz
+ * readFileSync + JSON.parse a cada chamada, e o caller já tem a config em mão
+ * neste mesmo tick (a cada 3 s, para sempre, em cada loja).
  */
 async function fetchAndEnqueuePendingJobs(
+  apiBaseUrl: string,
   sessionToken: string,
   signal: AbortSignal
 ): Promise<PollResult> {
-  const url = `${ZUPPY_APP_URL}/api/printer/jobs`
+  const url = `${apiBaseUrl}/api/printer/jobs`
   const res = await fetch(url, {
     method: 'GET',
     headers: {
@@ -321,7 +336,11 @@ async function pollTick(generation: number): Promise<void> {
   activeController = controller
   let result: PollResult
   try {
-    result = await fetchAndEnqueuePendingJobs(cfg.session_token!, controller.signal)
+    result = await fetchAndEnqueuePendingJobs(
+      resolveApiBaseUrl(cfg),
+      cfg.session_token!,
+      controller.signal
+    )
   } catch (err) {
     // abort() proposital (disconnect/reconfigure) não é erro real
     if (controller.signal.aborted) return

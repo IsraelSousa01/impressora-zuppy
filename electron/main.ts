@@ -76,10 +76,18 @@ function registerIpcHandlers(): void {
   ipcMain.handle('get-printers', () => listPrinters())
 
   ipcMain.handle('save-config', async (_event, patch: Record<string, unknown>) => {
-    setConfig(patch as Parameters<typeof setConfig>[0])
+    // `api_url` decide para QUAL Zuppy este app manda o device_token, e o único
+    // caminho que pode gravá-lo é o POST /configure — lá ele passa pela
+    // allowlist e precisa bater com o `Origin` do pareamento. Aqui a chave é
+    // descartada: a janela de configurações não tem por que mexer nisso.
+    const { api_url: _apiUrlIgnored, ...safePatch } = patch
+    void _apiUrlIgnored
 
-    // Reconnect with new config if device token was updated
-    if (patch.device_token) {
+    setConfig(safePatch as Parameters<typeof setConfig>[0])
+
+    // Reconnect with new config if device token was updated — lendo o patch
+    // que foi REALMENTE gravado, não o original.
+    if (safePatch.device_token) {
       await disconnect()
       await connect()
     }
