@@ -26,6 +26,12 @@ export interface AppConfig {
   /** Thermal paper width */
   paper_size: '80mm' | '58mm'
   /**
+   * Origem da API do Zuppy que ESTE app chama; `null`/ausente = default de
+   * produção. Gravada só pelo POST /configure — o porquê e as regras vivem em
+   * `resolveApiBaseUrl` (electron/config.ts).
+   */
+  api_url?: string | null
+  /**
    * Colunas de texto medidas por calibração explícita do usuário (não um
    * palpite derivado de `paper_size`). Só existe depois de uma calibração
    * real; ausente = "não calibrado ainda". Enviado no handshake

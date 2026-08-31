@@ -15,7 +15,7 @@ import { EventEmitter } from 'events'
 import { printOrder, printRenderedComandas, stationColumns, type OrderData, type RenderedComanda } from './printer'
 import { getConfig, savePendingQueue, addLog } from './store'
 import { createLogger, logPrintResult } from './logger'
-import { ZUPPY_APP_URL } from './config'
+import { resolveApiBaseUrl } from './config'
 
 const log = createLogger('QUEUE')
 
@@ -139,7 +139,7 @@ async function fetchJobData(
   const cfg = getConfig()
   if (!cfg.session_token) throw new Error('No printer session active')
 
-  const url = `${ZUPPY_APP_URL}/api/printer/orders/${orderId}`
+  const url = `${resolveApiBaseUrl(cfg)}/api/printer/orders/${orderId}`
   const res = await fetch(url, {
     method: 'GET',
     headers: {
@@ -184,7 +184,7 @@ async function confirmJobStatus(
   const cfg = getConfig()
   if (!cfg.session_token) throw new Error('No printer session active')
 
-  const url = `${ZUPPY_APP_URL}/api/printer/jobs/${jobId}/confirm`
+  const url = `${resolveApiBaseUrl(cfg)}/api/printer/jobs/${jobId}/confirm`
   const res = await fetch(url, {
     method: 'PATCH',
     headers: {

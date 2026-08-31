@@ -14,13 +14,15 @@
  * Security:
  *   - Binds to 127.0.0.1 only (never 0.0.0.0)
  *   - CORS restricted to *.zuppyfood.com.br and http://localhost:*
+ *   - Host header restricted to loopback (anti DNS rebinding)
  */
 
 import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
 import { Server } from 'http'
 import { app as electronApp } from 'electron'
-import { getConfig, setConfig, isConfigured, getLogs } from './store'
+import { getConfig, setConfig, isConfigured, getLogs, type AppConfig } from './store'
+import { isAllowedZuppyOrigin, canonicalizeZuppyApiOrigin } from './config'
 import { getConnectionStatus, connect, disconnect } from './realtime'
 import { getQueueStatus } from './print-queue'
 import { getUpdateState, installNow } from './updater'
@@ -39,16 +41,9 @@ const corsOptions: cors.CorsOptions = {
     // Allow requests with no origin (e.g. same-process fetch, Postman during dev)
     if (!origin) return callback(null, true)
 
-    // Domínio canônico de produção é zuppyfood.com.br — o Gestor roda no apex
-    // e em subdomínios (gestordepedidos., pedido.). Aceita o apex e qualquer
-    // subdomínio *.zuppyfood.com.br, mais localhost pro dev.
-    const allowed =
-      origin === 'https://zuppyfood.com.br' ||
-      /^https:\/\/([a-z0-9-]+\.)+zuppyfood\.com\.br$/.test(origin) ||
-      /^http:\/\/localhost(:\d+)?$/.test(origin) ||
-      /^http:\/\/127\.0\.0\.1(:\d+)?$/.test(origin)
-
-    if (allowed) {
+    // Mesma allowlist que valida o `api_url` do /configure (electron/config.ts):
+    // quem pode falar com este app é quem este app pode chamar.
+    if (isAllowedZuppyOrigin(origin)) {
       callback(null, true)
     } else {
       log.warn(`CORS blocked origin: ${origin}`)
@@ -58,6 +53,24 @@ const corsOptions: cors.CorsOptions = {
   methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
+}
+
+// ─── Host header ──────────────────────────────────────────────────────────────
+
+/**
+ * `Host` aceito por este servidor: só o loopback, com a porta em que ele
+ * escuta.
+ *
+ * Ligar em 127.0.0.1 impede que a máquina da loja seja alcançada pela rede,
+ * mas NÃO impede DNS rebinding: um domínio do atacante que resolve para
+ * 127.0.0.1 faz o navegador da vítima bater neste servidor tratando tudo como
+ * same-origin — sem `Origin`, o CORS nem entra na conversa. O que denuncia
+ * esse request é o `Host`, que carrega o nome pelo qual o navegador chegou.
+ */
+export function isAllowedLocalHostHeader(host: string | undefined, port: number): boolean {
+  if (!host) return false
+  const normalized = host.trim().toLowerCase()
+  return normalized === `127.0.0.1:${port}` || normalized === `localhost:${port}`
 }
 
 // ─── /print-raw validation ────────────────────────────────────────────────────
@@ -123,6 +136,158 @@ export function validatePrintRawDocument(bytesBase64: unknown): PrintRawValidati
   return { ok: true, bytes }
 }
 
+// ─── /configure ───────────────────────────────────────────────────────────────
+
+/** Corpo do POST /configure. `api_url` é `unknown`: chega do navegador. */
+export interface ConfigureRequestBody {
+  tenant_id?: string
+  tenant_name?: string
+  auto_print?: boolean
+  device_token?: string
+  printer_name?: string
+  paper_size?: '80mm' | '58mm'
+  api_url?: unknown
+}
+
+export type ConfigurePlan =
+  | {
+      ok: true
+      /** `device_token` é garantido: sem ele o plano nem chega a ser ok. */
+      patch: Partial<AppConfig> & { device_token: string }
+      identityChanged: boolean
+    }
+  | { ok: false; status: 400; error: string }
+
+/**
+ * Normaliza uma origem para comparação: sem espaços, sem barra final e em
+ * minúsculas. Origem não tem componente sensível a caixa (esquema, host e
+ * porta), então baixar a string inteira é seguro e deixa `api_url` e o header
+ * `Origin` comparáveis byte a byte.
+ */
+function normalizeOrigin(value: string): string {
+  return value.trim().replace(/\/+$/, '').toLowerCase()
+}
+
+/**
+ * Destino local (`http://localhost[:porta]`, `http://127.0.0.1[:porta]`). A
+ * allowlist aceita esses hosts porque o Gestor rodando em `npm run dev` precisa
+ * falar com o app — mas mandar o device_token PARA localhost é outra história:
+ * num app instalado na loja, quem escuta em localhost é qualquer programa da
+ * máquina, não o Zuppy. Por isso o pareamento só aceita destino local fora de
+ * build empacotado (ver `allowLocalApiOrigin`).
+ */
+function isLocalApiOrigin(origin: string): boolean {
+  return /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
+}
+
+/**
+ * Decide o que o POST /configure vai gravar — validação, detecção de troca de
+ * identidade e patch — sem tocar em store, rede ou express. O handler só
+ * aplica o resultado.
+ *
+ * Regras que valem a pena ler antes de mexer:
+ *
+ *  - `api_url` diz para QUAL Zuppy este app manda o device_token, então passa
+ *    pela mesma allowlist do CORS (isAllowedZuppyOrigin) e precisa ser igual ao
+ *    header `Origin` do request: assim uma aba do Gestor de produção não
+ *    consegue apontar a impressora da loja para outro host. Os dois lados são
+ *    canonizados antes da comparação (canonicalizeZuppyApiOrigin), então uma
+ *    aba no apex pareando com `api_url` do www é o MESMO host, não divergência.
+ *  - `api_url` sem `Origin` é rejeitado: sem o header não há como amarrar o
+ *    destino a quem pediu, e a allowlist sozinha aceitaria qualquer host do
+ *    Zuppy. Body SEM `api_url` e sem `Origin` continua valendo — é o Gestor
+ *    antigo e o pareamento por Postman/same-process, que não mudam destino.
+ *  - `opts.allowLocalApiOrigin` (false em build empacotado) barra destino
+ *    local: ver isLocalApiOrigin.
+ *  - `api_url` inválido rejeita o request INTEIRO: não grava nem os outros
+ *    campos, pra não deixar o app meio pareado.
+ *  - `api_url` ausente (Gestor antigo, que ainda não manda o campo) LIMPA o
+ *    valor salvo (`null` explícito, porque setConfig faz merge raso): o app
+ *    segue quem o pareou por último e volta ao default de produção.
+ *  - Trocar device_token ou tenant_id é troca de identidade e zera a sessão:
+ *    ela pertencia ao tenant anterior. Sem isso, connect() vê session_token
+ *    presente e pula a re-autenticação, reusando a sessão da loja anterior — o
+ *    app fica preso em "conectando". (Bug real: app da PIZZA PIZZA reusando a
+ *    session_token da Praça Zuppy.)
+ *  - Mudar SÓ o `api_url` NÃO é troca de identidade: a sessão é emitida pelo
+ *    backend, não pelo host. `gestordepedidos.` e `www.` são o mesmo banco, e
+ *    zerar a sessão ao alternar entre eles recriaria o ping-pong de
+ *    re-autenticação que este endpoint existe pra evitar. Quando o host muda de
+ *    verdade (dev ↔ prod), o device_token muda junto e já zera; e se um host
+ *    não reconhecer a sessão, o 401 do poll re-autentica sozinho
+ *    (electron/realtime.ts). O handler reconecta em todo /configure de
+ *    qualquer forma, então a base nova entra em vigor no tick seguinte.
+ */
+export function planConfigureUpdate(
+  current: Partial<AppConfig>,
+  body: ConfigureRequestBody,
+  originHeader: string | undefined,
+  opts: { allowLocalApiOrigin: boolean }
+): ConfigurePlan {
+  const {
+    tenant_id,
+    tenant_name,
+    auto_print,
+    device_token,
+    printer_name,
+    paper_size,
+    api_url,
+  } = body
+
+  // Entrada do navegador: `device_token` só serve se for string preenchida —
+  // um número viraria `12345.slice` mais adiante.
+  if (typeof device_token !== 'string' || device_token === '') {
+    return { ok: false, status: 400, error: 'Missing required field: device_token' }
+  }
+
+  let nextApiUrl: string | null = null
+  if (api_url !== undefined && api_url !== null) {
+    if (typeof api_url !== 'string') {
+      return { ok: false, status: 400, error: 'api_url not allowed' }
+    }
+
+    const candidate = canonicalizeZuppyApiOrigin(normalizeOrigin(api_url))
+    if (!isAllowedZuppyOrigin(candidate)) {
+      return { ok: false, status: 400, error: 'api_url not allowed' }
+    }
+
+    if (!opts.allowLocalApiOrigin && isLocalApiOrigin(candidate)) {
+      return { ok: false, status: 400, error: 'api_url not allowed' }
+    }
+
+    const origin = originHeader ? canonicalizeZuppyApiOrigin(normalizeOrigin(originHeader)) : ''
+    if (origin === '') {
+      return { ok: false, status: 400, error: 'api_url requires Origin' }
+    }
+
+    if (candidate !== origin) {
+      return { ok: false, status: 400, error: 'api_url must match request origin' }
+    }
+
+    nextApiUrl = candidate
+  }
+
+  const identityChanged =
+    current.device_token !== device_token ||
+    (tenant_id !== undefined && current.tenant_id !== tenant_id)
+
+  const patch: Partial<AppConfig> & { device_token: string } = {
+    device_token,
+    api_url: nextApiUrl,
+    ...(tenant_id !== undefined && { tenant_id }),
+    ...(tenant_name !== undefined && { tenant_name }),
+    ...(auto_print !== undefined && { auto_print }),
+    ...(printer_name !== undefined && { printer_name }),
+    ...(paper_size !== undefined && { paper_size }),
+    ...(identityChanged && {
+      session_token: undefined,
+      session_expires_at: undefined,
+    }),
+  }
+
+  return { ok: true, patch, identityChanged }
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 function buildRouter() {
@@ -152,6 +317,9 @@ function buildRouter() {
       lastPrint: logs[0] ?? null,
       tenant_name: cfg.tenant_name ?? null,
       tenant_id: cfg.tenant_id ?? null,
+      // Origem da API gravada no pareamento; `null` = default de produção.
+      // O Gestor usa isto pra saber se o app está apontado pro ambiente dele.
+      api_url: cfg.api_url ?? null,
       connected: getConnectionStatus(),
       // Update baixado aguardando janela segura (loja fechada + fila vazia).
       // `downloadedAt` deixa o painel detectar "esperando há muito tempo" e
@@ -162,59 +330,34 @@ function buildRouter() {
 
   /** POST /configure */
   router.post('/configure', async (req: Request, res: Response) => {
-    const {
-      tenant_id,
-      tenant_name,
-      auto_print,
-      device_token,
-      printer_name,
-      paper_size,
-    } = req.body as {
-      tenant_id?: string
-      tenant_name?: string
-      auto_print?: boolean
-      device_token?: string
-      printer_name?: string
-      paper_size?: '80mm' | '58mm'
-    }
+    // Valida ANTES de qualquer escrita: request rejeitado não deixa rastro
+    // no store (ver planConfigureUpdate).
+    const plan = planConfigureUpdate(
+      getConfig(),
+      req.body as ConfigureRequestBody,
+      req.get('origin'),
+      // Em `npm run dev` o Gestor roda em localhost e precisa poder apontar o
+      // app pra si; no app instalado na loja, destino local é sempre suspeito.
+      { allowLocalApiOrigin: !electronApp.isPackaged }
+    )
 
-    if (!device_token) {
-      res.status(400).json({
-        error: 'Missing required field: device_token',
-      })
+    if (!plan.ok) {
+      res.status(plan.status).json({ error: plan.error })
       return
     }
 
-    try {
-      // Trocar de dispositivo/loja invalida a sessão anterior: ela pertence ao
-      // tenant antigo. Se não zerar, connectSSEStream() vê session_token
-      // presente e PULA a re-autenticação (realtime.ts), reusando a sessão da
-      // loja anterior — o app nunca reconecta e fica preso em "conectando".
-      // (Bug real: app da PIZZA PIZZA reusando a session_token da Praça Zuppy.)
-      const current = getConfig()
-      const identityChanged =
-        current.device_token !== device_token ||
-        (tenant_id !== undefined && current.tenant_id !== tenant_id)
+    const device_token = plan.patch.device_token
+    // Token curto não mostra NADA: os 4 últimos caracteres de um token de 6
+    // seriam quase o token inteiro no log.
+    const maskedToken = device_token.length > 8 ? `…${device_token.slice(-4)}` : '****'
 
-      // Persist configuration
-      setConfig({
-        device_token,
-        ...(tenant_id !== undefined && { tenant_id }),
-        ...(tenant_name !== undefined && { tenant_name }),
-        ...(auto_print !== undefined && { auto_print }),
-        ...(printer_name !== undefined && { printer_name }),
-        ...(paper_size !== undefined && { paper_size }),
-        // Zera a sessão só quando a identidade muda — força re-login com o
-        // device_token novo. Trocas de impressora/papel preservam a sessão.
-        ...(identityChanged && {
-          session_token: undefined,
-          session_expires_at: undefined,
-        }),
-      })
+    try {
+      setConfig(plan.patch)
 
       log.info(
-        `Configuration updated with device_token: ${device_token}` +
-          (identityChanged ? ' (identidade mudou — sessão zerada)' : '')
+        `Configuration updated (device_token ${maskedToken}, ` +
+          `api_url: ${plan.patch.api_url ?? 'default'})` +
+          (plan.identityChanged ? ' (identidade mudou — sessão zerada)' : '')
       )
 
       // Reconnect polling with new config
@@ -354,6 +497,17 @@ let server: Server | null = null
 export function startHttpServer(): Promise<void> {
   return new Promise((resolve, reject) => {
     const expressApp = express()
+
+    // Antes de tudo (inclusive do parse do body): `Host` estranho é DNS
+    // rebinding, não cliente legítimo — ver isAllowedLocalHostHeader.
+    expressApp.use((req: Request, res: Response, next: NextFunction) => {
+      if (!isAllowedLocalHostHeader(req.headers.host, HTTP_PORT)) {
+        log.warn(`Blocked request with Host header: ${req.headers.host ?? '(ausente)'}`)
+        res.status(403).json({ error: 'bad host' })
+        return
+      }
+      next()
+    })
 
     expressApp.use(cors(corsOptions))
     expressApp.use(express.json({ limit: '1mb' }))
