@@ -21,7 +21,7 @@ import { startHttpServer, stopHttpServer } from './http-server'
 import { connect, disconnect } from './realtime'
 import { restoreQueue, getQueueStatus } from './print-queue'
 import { registerDownloadedUpdate } from './updater'
-import { listPrinters, testPrint } from './printer'
+import { enumeratePrinters, listPrinters, testPrint } from './printer'
 import { createTray, updateTray, destroyTray } from './tray'
 import { createLogger } from './logger'
 
@@ -74,6 +74,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle('get-logs', () => getLogs())
 
   ipcMain.handle('get-printers', () => listPrinters())
+  ipcMain.handle('enumerate-printers', () => enumeratePrinters())
 
   ipcMain.handle('save-config', async (_event, patch: Record<string, unknown>) => {
     // `api_url` decide para QUAL Zuppy este app manda o device_token, e o único

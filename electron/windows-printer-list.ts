@@ -27,23 +27,46 @@ export function parseWindowsPrinterNames(stdout: string): string[] {
   return [...names]
 }
 
+export interface PrinterEnumeration {
+  printers: string[]
+  /** Preenchido só quando TODOS os comandos falharam: lista vazia por falha ≠ nenhuma impressora instalada. */
+  error: string | null
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 /**
  * Lista as impressoras instaladas sem depender do WMIC, removido/descontinuado
  * em instalações recentes do Windows. O segundo comando cobre máquinas onde
  * o módulo PrintManagement não está disponível.
+ *
+ * Diferente de uma lista simples, informa quando a enumeração FALHOU — assim
+ * o chamador não confunde "não consegui listar" com "não há impressoras".
  */
-export async function listWindowsPrinterNames(
+export async function enumerateWindowsPrinters(
   runCommand: PrinterCommandRunner = execAsync,
   onCommandError: (command: string, error: unknown) => void = () => undefined,
-): Promise<string[]> {
+): Promise<PrinterEnumeration> {
+  let lastError: unknown = null
+
   for (const command of WINDOWS_PRINTER_COMMANDS) {
     try {
       const { stdout } = await runCommand(command, { timeout: COMMAND_TIMEOUT_MS })
-      return parseWindowsPrinterNames(stdout)
+      return { printers: parseWindowsPrinterNames(stdout), error: null }
     } catch (error) {
+      lastError = error
       onCommandError(command, error)
     }
   }
 
-  return []
+  return { printers: [], error: describeError(lastError) }
+}
+
+export async function listWindowsPrinterNames(
+  runCommand: PrinterCommandRunner = execAsync,
+  onCommandError: (command: string, error: unknown) => void = () => undefined,
+): Promise<string[]> {
+  return (await enumerateWindowsPrinters(runCommand, onCommandError)).printers
 }

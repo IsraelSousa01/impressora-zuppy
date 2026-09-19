@@ -22,7 +22,7 @@ import { createLogger } from './logger'
 import { getConfig } from './store'
 import { ZUPPY_APP_URL } from './config'
 import { layoutTwoColumns, wrapText, doubleWidthColumns } from './text-layout'
-import { listWindowsPrinterNames } from './windows-printer-list'
+import { enumerateWindowsPrinters, type PrinterEnumeration } from './windows-printer-list'
 
 const log = createLogger('PRINTER')
 
@@ -789,11 +789,25 @@ export async function buildOperationalTicketBytes(
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-/** Returns the list of installed printer names from Windows. */
-export async function listPrinters(): Promise<string[]> {
-  return listWindowsPrinterNames(undefined, (command, error) => {
+let lastPrinterEnumerationError: string | null = null
+
+/** Motivo da última falha ao listar impressoras (`null` = última listagem funcionou). */
+export function getPrinterEnumerationError(): string | null {
+  return lastPrinterEnumerationError
+}
+
+/** Lista as impressoras do Windows e informa se a enumeração falhou. */
+export async function enumeratePrinters(): Promise<PrinterEnumeration> {
+  const result = await enumerateWindowsPrinters(undefined, (command, error) => {
     log.error(`Failed to list printers with ${command}`, error)
   })
+  lastPrinterEnumerationError = result.error
+  return result
+}
+
+/** Returns the list of installed printer names from Windows. */
+export async function listPrinters(): Promise<string[]> {
+  return (await enumeratePrinters()).printers
 }
 
 /**

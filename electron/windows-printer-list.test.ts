@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { listWindowsPrinterNames, parseWindowsPrinterNames } from './windows-printer-list'
+import {
+  enumerateWindowsPrinters,
+  listWindowsPrinterNames,
+  parseWindowsPrinterNames,
+} from './windows-printer-list'
 
 describe('parseWindowsPrinterNames', () => {
   it('normaliza linhas do PowerShell, preserva acentos e remove duplicatas', () => {
@@ -52,5 +56,43 @@ describe('listWindowsPrinterNames', () => {
     })
 
     expect(printers).toEqual([])
+  })
+})
+
+describe('enumerateWindowsPrinters', () => {
+  it('sem erro quando lista normalmente', async () => {
+    const result = await enumerateWindowsPrinters(async () => ({
+      stdout: 'EPSON TM-T20X Receipt\r\n',
+    }))
+
+    expect(result).toEqual({ printers: ['EPSON TM-T20X Receipt'], error: null })
+  })
+
+  it('sem erro quando o Windows realmente não tem impressoras', async () => {
+    const result = await enumerateWindowsPrinters(async () => ({ stdout: '\r\n' }))
+
+    expect(result).toEqual({ printers: [], error: null })
+  })
+
+  it('reporta o motivo quando todos os comandos falham (falha ≠ sem impressoras)', async () => {
+    let call = 0
+    const result = await enumerateWindowsPrinters(async () => {
+      call += 1
+      throw new Error(`falha ${call}`)
+    })
+
+    expect(result).toEqual({ printers: [], error: 'falha 2' })
+  })
+
+  it('não reporta erro quando o segundo comando funciona', async () => {
+    let call = 0
+    const result = await enumerateWindowsPrinters(async () => {
+      call += 1
+      if (call === 1) throw new Error('sem PrintManagement')
+      return { stdout: 'EPSON TM-T20X Receipt\r\n' }
+    })
+
+    expect(result.error).toBeNull()
+    expect(result.printers).toEqual(['EPSON TM-T20X Receipt'])
   })
 })
