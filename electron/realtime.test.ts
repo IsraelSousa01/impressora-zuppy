@@ -1,21 +1,25 @@
 /**
  * electron/realtime.test.ts
  *
- * Cobre as regras puras do polling client (1.0.8, cutover SSE → polling):
+ * Cobre o polling client (1.0.8, cutover SSE → polling):
  *
  *   - resolveNextPollIntervalMs: contrato do `next_poll_ms` do servidor —
  *     opcional (ausente mantém o último valor conhecido), clampado em
  *     [1000, 60000], nunca confiança cega no número.
  *   - parseRetryAfterMs: Retry-After de um 429 em segundos ou HTTP-date,
  *     com clamp pra não virar retry imediato nem congelar a impressora.
+ *   - requestPrinterSession: o handshake cru (POST /api/printer/auth) que o
+ *     polling e o pareamento manual dividem — o campo ADITIVO `destination`
+ *     (impressora nomeada, ausente no token legado da loja) e a distinção
+ *     entre "servidor recusou" e "não deu pra falar com o servidor".
  *
  * `realtime.ts` importa `electron` (app.getVersion no handshake de auth) e,
  * via `./store`/`./print-queue`, o `electron-store` — ambos exigem rodar
  * dentro do Electron. Mocka-se os dois só pra permitir o import fora do
- * Electron (mesmo padrão de http-server.test.ts); as funções testadas são
- * puras e não tocam nenhum deles.
+ * Electron (mesmo padrão de http-server.test.ts); as funções de ritmo são
+ * puras e não tocam nenhum deles, e o handshake roda com `fetch` stubado.
  */
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 vi.mock('electron', () => ({
   app: {
@@ -39,7 +43,8 @@ vi.mock('electron-store', () => {
   return { default: MockElectronStore }
 })
 
-const { resolveNextPollIntervalMs, parseRetryAfterMs } = await import('./realtime')
+const { resolveNextPollIntervalMs, parseRetryAfterMs, requestPrinterSession, PrinterAuthError } =
+  await import('./realtime')
 
 describe('resolveNextPollIntervalMs', () => {
   it('ausente (undefined): mantém o último valor conhecido', () => {
@@ -93,5 +98,112 @@ describe('parseRetryAfterMs', () => {
 
   it('lixo não parseável: null (caller cai no backoff)', () => {
     expect(parseRetryAfterMs('em breve')).toBeNull()
+  })
+})
+
+
+describe('requestPrinterSession — handshake POST /api/printer/auth', () => {
+  const RESPOSTA_BASE = {
+    session_token: 'sess-abc',
+    expires_at: '2026-01-01T00:00:00.000Z',
+    tenant_id: 'tenant-1',
+    tenant_name: 'Podrão',
+    auto_print: true,
+  }
+
+  const fetchMock = vi.fn()
+
+  function responder(status: number, body: unknown): Response {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    } as unknown as Response
+  }
+
+  beforeEach(() => {
+    fetchMock.mockReset()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('devolve a sessão e a impressora nomeada quando o servidor manda destination', async () => {
+    fetchMock.mockResolvedValueOnce(
+      responder(200, {
+        ...RESPOSTA_BASE,
+        destination: { id: 'dest-1', name: 'Cozinha', purpose: 'kitchen' },
+      })
+    )
+
+    const session = await requestPrinterSession('tok-1', {
+      apiBaseUrl: 'https://dev.zuppyfood.com.br',
+    })
+
+    expect(session.session_token).toBe('sess-abc')
+    expect(session.destination).toEqual({ id: 'dest-1', name: 'Cozinha', purpose: 'kitchen' })
+    expect(fetchMock.mock.calls[0][0]).toBe('https://dev.zuppyfood.com.br/api/printer/auth')
+  })
+
+  it('servidor sem o campo (ou token legado da loja): destination null, tudo o mais igual', async () => {
+    fetchMock.mockResolvedValueOnce(responder(200, RESPOSTA_BASE))
+
+    const session = await requestPrinterSession('tok-1', { apiBaseUrl: 'https://x.zuppyfood.com.br' })
+
+    expect(session.destination).toBeNull()
+    expect(session.tenant_name).toBe('Podrão')
+  })
+
+  it('destination malformado não vira destino (ia para o disco e para a bandeja)', async () => {
+    fetchMock.mockResolvedValueOnce(
+      responder(200, { ...RESPOSTA_BASE, destination: { name: 'Cozinha' } })
+    )
+
+    const session = await requestPrinterSession('tok-1', { apiBaseUrl: 'https://x.zuppyfood.com.br' })
+
+    expect(session.destination).toBeNull()
+  })
+
+  it('o corpo leva o token, o papel e a versão; columns só quando calibrado; nunca segue redirect', async () => {
+    fetchMock.mockResolvedValueOnce(responder(200, RESPOSTA_BASE))
+    await requestPrinterSession('tok-1', {
+      apiBaseUrl: 'https://x.zuppyfood.com.br',
+      paperSize: '58mm',
+    })
+
+    const init = fetchMock.mock.calls[0][1] as { body: string; redirect: string }
+    expect(init.redirect).toBe('error')
+    expect(JSON.parse(init.body)).toEqual({
+      device_token: 'tok-1',
+      paper_size: '58mm',
+      app_version: '0.0.0-test',
+    })
+
+    fetchMock.mockResolvedValueOnce(responder(200, RESPOSTA_BASE))
+    await requestPrinterSession('tok-1', { apiBaseUrl: 'https://x.zuppyfood.com.br', columns: 42 })
+    const comColunas = JSON.parse((fetchMock.mock.calls[1][1] as { body: string }).body)
+    expect(comColunas.columns).toBe(42)
+  })
+
+  it('resposta de erro: PrinterAuthError com o status (o pareamento distingue código errado de rede)', async () => {
+    fetchMock.mockResolvedValueOnce(responder(401, { error: 'invalid token' }))
+
+    await expect(
+      requestPrinterSession('tok-1', { apiBaseUrl: 'https://x.zuppyfood.com.br' })
+    ).rejects.toMatchObject({ name: 'PrinterAuthError', httpStatus: 401 })
+  })
+
+  it('sem resposta (offline, DNS, redirect barrado): PrinterAuthError sem status', async () => {
+    fetchMock.mockRejectedValueOnce(new Error('fetch failed'))
+
+    const erro = await requestPrinterSession('tok-1', {
+      apiBaseUrl: 'https://x.zuppyfood.com.br',
+    }).catch((err: unknown) => err)
+
+    expect(erro).toBeInstanceOf(PrinterAuthError)
+    expect((erro as InstanceType<typeof PrinterAuthError>).httpStatus).toBeNull()
   })
 })

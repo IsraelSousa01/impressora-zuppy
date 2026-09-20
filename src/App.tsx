@@ -39,6 +39,8 @@ interface AppConfig {
   printer_name?: string
   paper_size?: '80mm' | '58mm'
   auto_print?: boolean
+  /** Impressora nomeada deste device_token; ausente no token legado da loja. */
+  destination?: { id: string; name: string; purpose: string | null } | null
 }
 
 // ─── Window API type ──────────────────────────────────────────────────────────
@@ -273,8 +275,12 @@ export default function App() {
           {/* Logo / Title */}
           <div>
             <div style={{ fontWeight: 700, fontSize: 16 }}>🖨️ Zuppy Impressora</div>
-            {config.tenant_name && (
-              <div style={{ color: '#94a3b8', fontSize: 12 }}>{config.tenant_name}</div>
+            {/* Impressora nomeada quando houver ("Cozinha — Podrão"); sem
+                destino, o nome da loja, como sempre foi. */}
+            {(config.destination?.name ?? config.tenant_name) && (
+              <div style={{ color: '#94a3b8', fontSize: 12 }}>
+                {[config.destination?.name, config.tenant_name].filter(Boolean).join(' — ')}
+              </div>
             )}
           </div>
         </div>

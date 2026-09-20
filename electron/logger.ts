@@ -26,6 +26,19 @@ function write(level: Level, scope: string, message: string, meta?: unknown): vo
   }
 }
 
+/**
+ * Forma de um `device_token` que PODE aparecer no log: os 4 últimos
+ * caracteres, e só quando o token é longo o bastante para que isso não seja
+ * quase o token inteiro. Token curto vira `****`.
+ *
+ * Serve para o suporte distinguir "qual token esta máquina está usando" sem
+ * que o segredo caia no arquivo de log da loja. `session_token` não passa por
+ * aqui: esse nunca é logado, nem mascarado.
+ */
+export function maskDeviceToken(token: string): string {
+  return token.length > 8 ? `…${token.slice(-4)}` : '****'
+}
+
 /** Creates a scoped logger instance */
 export function createLogger(scope: string) {
   return {

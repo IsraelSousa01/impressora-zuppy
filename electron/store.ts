@@ -5,6 +5,8 @@
 
 import Store from 'electron-store'
 
+import type { PrinterDestination } from './destination'
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /** Persistent app configuration saved by the web dashboard via POST /configure */
@@ -39,6 +41,13 @@ export interface AppConfig {
    * exata desta impressora.
    */
   columns?: number
+  /**
+   * Impressora nomeada a que este device_token pertence ("Cozinha", "Bar"),
+   * devolvida pelo handshake. `null` = token legado da loja, sem destino —
+   * o comportamento de sempre. Reescrito a cada autenticação: quem manda é o
+   * servidor, não o que ficou gravado aqui.
+   */
+  destination?: PrinterDestination | null
 }
 
 /** A single entry in the recent-prints log */
@@ -65,14 +74,33 @@ interface StoreSchema {
 
 // ─── Singleton store ──────────────────────────────────────────────────────────
 
-const store = new Store<StoreSchema>({
-  name: 'zuppy-impressora',
-  defaults: {
-    config: {},
-    logs: [],
-    pendingQueue: [],
-  },
-})
+let store: Store<StoreSchema> | null = null
+
+/**
+ * O electron-store desta instância, criado na PRIMEIRA leitura — nunca no
+ * import do módulo.
+ *
+ * O arquivo fica dentro de `app.getPath('userData')`, e é o main que decide
+ * essa pasta (profile desta instância, `electron/instance.ts`) logo no início
+ * do boot. Construir o store no import amarraria o arquivo à pasta default
+ * antes dessa decisão, porque os imports são avaliados antes do corpo do main
+ * — e as duas instâncias voltariam a dividir device_token e session_token.
+ *
+ * Nome do arquivo inalterado (`zuppy-impressora.json`): na instância default a
+ * pasta também é a de hoje, então o app já instalado lê exatamente o mesmo
+ * arquivo de sempre.
+ */
+function getStore(): Store<StoreSchema> {
+  store ??= new Store<StoreSchema>({
+    name: 'zuppy-impressora',
+    defaults: {
+      config: {},
+      logs: [],
+      pendingQueue: [],
+    },
+  })
+  return store
+}
 
 // ─── Config helpers ───────────────────────────────────────────────────────────
 
@@ -80,7 +108,7 @@ const store = new Store<StoreSchema>({
  * Returns the full stored config (may be partial if not yet configured).
  */
 export function getConfig(): Partial<AppConfig> {
-  return store.get('config')
+  return getStore().get('config')
 }
 
 /**
@@ -88,8 +116,8 @@ export function getConfig(): Partial<AppConfig> {
  * Emits no events – callers are responsible for reacting.
  */
 export function setConfig(patch: Partial<AppConfig>): void {
-  const current = store.get('config')
-  store.set('config', { ...current, ...patch })
+  const current = getStore().get('config')
+  getStore().set('config', { ...current, ...patch })
 }
 
 /**
@@ -97,7 +125,7 @@ export function setConfig(patch: Partial<AppConfig>): void {
  * are present in the stored config.
  */
 export function isConfigured(): boolean {
-  const cfg = store.get('config')
+  const cfg = getStore().get('config')
   return Boolean(cfg.device_token)
 }
 
@@ -110,16 +138,16 @@ const MAX_LOGS = 100
  * Prepends a new log entry, keeping at most MAX_LOGS entries.
  */
 export function addLog(entry: PrintLog): void {
-  const logs = store.get('logs')
+  const logs = getStore().get('logs')
   const updated = [entry, ...logs].slice(0, MAX_LOGS)
-  store.set('logs', updated)
+  getStore().set('logs', updated)
 }
 
 /**
  * Returns recent print logs, newest first.
  */
 export function getLogs(): PrintLog[] {
-  return store.get('logs')
+  return getStore().get('logs')
 }
 
 // ─── Crash-recovery queue ─────────────────────────────────────────────────────
@@ -128,14 +156,12 @@ export function getLogs(): PrintLog[] {
  * Overwrites the crash-recovery queue with the given job IDs.
  */
 export function savePendingQueue(jobIds: string[]): void {
-  store.set('pendingQueue', jobIds)
+  getStore().set('pendingQueue', jobIds)
 }
 
 /**
  * Returns the crash-recovery queue (may be empty).
  */
 export function loadPendingQueue(): string[] {
-  return store.get('pendingQueue')
+  return getStore().get('pendingQueue')
 }
-
-export default store
