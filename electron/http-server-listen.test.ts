@@ -9,7 +9,10 @@
  *     comparação, ou todo request legítimo vira 403, ou a barreira de DNS
  *     rebinding deixa de valer;
  *   - o GET /status conta em que porta respondeu, que é como a tela do Zuppy
- *     distingue duas impressoras na mesma máquina.
+ *     distingue duas impressoras na mesma máquina;
+ *   - as respostas se identificam como este app (header + campo no corpo), que
+ *     é o que impede um processo qualquer escutando numa porta da faixa de ser
+ *     promovido a impressora da loja e receber o device_token.
  *
  * Usa portas altas (45800+) de propósito: a 7847 pode estar ocupada pelo app
  * de verdade rodando nesta máquina, e o teste não pode depender disso.
@@ -59,12 +62,17 @@ function fecharServidor(server: net.Server): Promise<void> {
   return new Promise((resolve) => server.close(() => resolve()))
 }
 
-/** GET no servidor local com controle total sobre o header `Host`. */
+/**
+ * GET no servidor local com controle total sobre o header `Host` e sobre
+ * headers extras (`Origin`, para exercitar o CORS). Devolve também os headers
+ * da RESPOSTA: o marcador de identidade do app é um deles.
+ */
 function get(
   port: number,
   path: string,
-  host?: string
-): Promise<{ status: number; body: string }> {
+  host?: string,
+  extraHeaders: Record<string, string> = {}
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
@@ -72,13 +80,15 @@ function get(
         port,
         path,
         method: 'GET',
-        headers: host === undefined ? {} : { Host: host },
+        headers: { ...(host === undefined ? {} : { Host: host }), ...extraHeaders },
       },
       (res) => {
         let body = ''
         res.setEncoding('utf8')
         res.on('data', (chunk) => (body += chunk))
-        res.on('end', () => resolve({ status: res.statusCode ?? 0, body }))
+        res.on('end', () =>
+          resolve({ status: res.statusCode ?? 0, body, headers: res.headers })
+        )
       }
     )
     req.on('error', reject)
@@ -101,7 +111,10 @@ describe('startHttpServer — porta por instância', () => {
 
     await expect(startHttpServer([porta])).resolves.toBe(porta)
     expect(getBoundPort()).toBe(porta)
-    await expect(get(porta, '/ping')).resolves.toEqual({ status: 200, body: '{"ok":true}' })
+    const { status, body } = await get(porta, '/ping')
+    expect(status).toBe(200)
+    // `ok` continua sendo o campo do health check; o marcador entrou ao lado.
+    expect(JSON.parse(body)).toEqual({ ok: true, zuppy_printer_app: 1 })
   })
 
   it('porta ocupada: cai na próxima da faixa em vez de morrer', async () => {
@@ -177,5 +190,93 @@ describe('startHttpServer — porta por instância', () => {
     // ocupada pelo app de verdade nesta máquina.
     const { HTTP_PORT } = await import('./http-server')
     expect(HTTP_PORT).toBe(7847)
+  })
+})
+
+describe('identidade do app nas respostas', () => {
+  const ORIGEM_ZUPPY = 'https://gestordepedidos.zuppyfood.com.br'
+
+  it('GET /status: marcador no header E no corpo', async () => {
+    const porta = PORTA_BASE + 40
+    await startHttpServer([porta])
+
+    const { status, body, headers } = await get(porta, '/status')
+    const payload = JSON.parse(body) as Record<string, unknown>
+
+    expect(status).toBe(200)
+    // Nome e valor EXATOS: é por eles que o Zuppy separa este app de um
+    // processo qualquer que escutou na porta da faixa.
+    expect(headers['x-zuppy-printer-app']).toBe('1')
+    expect(payload.zuppy_printer_app).toBe(1)
+  })
+
+  it('GET /ping: mesmo marcador, para a sonda barata', async () => {
+    const porta = PORTA_BASE + 41
+    await startHttpServer([porta])
+
+    const { body, headers } = await get(porta, '/ping')
+
+    expect(headers['x-zuppy-printer-app']).toBe('1')
+    expect(JSON.parse(body)).toMatchObject({ zuppy_printer_app: 1 })
+  })
+
+  it('header de identidade é exposto ao JS da página do Zuppy', async () => {
+    // Sem Access-Control-Expose-Headers o header CHEGA mas o fetch da página
+    // não consegue lê-lo — a checagem do outro lado falharia em produção e
+    // passaria aqui se o teste olhasse só a presença do header.
+    const porta = PORTA_BASE + 42
+    await startHttpServer([porta])
+
+    const { headers } = await get(porta, '/status', undefined, { Origin: ORIGEM_ZUPPY })
+
+    expect(String(headers['access-control-expose-headers']).toLowerCase()).toContain(
+      'x-zuppy-printer-app'
+    )
+  })
+
+  it('GET /status: forma validável e nenhum campo antigo perdido', async () => {
+    const porta = PORTA_BASE + 43
+    setConfig({ paper_size: '58mm' })
+    await startHttpServer([porta])
+
+    const { body } = await get(porta, '/status')
+    const payload = JSON.parse(body) as Record<string, unknown>
+
+    // Contrato do /status: o marcador é ADITIVO. Nenhum destes nomes pode
+    // sumir nem mudar de sentido — app novo continua falando com Gestor
+    // antigo, e Gestor novo com app antigo.
+    for (const campo of [
+      'status',
+      'version',
+      'printer',
+      'paper_size',
+      'queue',
+      'lastPrint',
+      'tenant_name',
+      'tenant_id',
+      'port',
+      'destination',
+      'display_name',
+      'api_url',
+      'connected',
+      'update',
+    ]) {
+      expect(payload).toHaveProperty(campo)
+    }
+
+    expect(typeof payload.version).toBe('string')
+    expect(payload.paper_size).toBe('58mm')
+  })
+
+  it('paper_size fora dos dois valores conhecidos não vaza para o /status', async () => {
+    const porta = PORTA_BASE + 44
+    // Valor que só um /configure antigo (ou adulterado) gravaria: o app
+    // imprime a 80 mm nesse caso, então é 80mm que ele deve declarar.
+    setConfig({ paper_size: 'A4' as unknown as '80mm' })
+    await startHttpServer([porta])
+
+    const { body } = await get(porta, '/status')
+
+    expect((JSON.parse(body) as Record<string, unknown>).paper_size).toBe('80mm')
   })
 })

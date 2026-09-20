@@ -5,7 +5,7 @@
  * (ver startHttpServer e electron/instance.ts).
  *
  * Endpoints:
- *   GET  /ping            → { ok: true }
+ *   GET  /ping            → { ok: true, zuppy_printer_app: 1 }
  *   GET  /status          → connection/queue status
  *   POST /configure       → save config and (re)connect realtime
  *   GET  /printers        → list Windows printers
@@ -17,6 +17,9 @@
  *   - Binds to 127.0.0.1 only (never 0.0.0.0)
  *   - CORS restricted to *.zuppyfood.com.br and http://localhost:*
  *   - Host header restricted to loopback NA PORTA EFETIVA (anti DNS rebinding)
+ *   - Toda resposta servida se identifica como este app (header
+ *     `X-Zuppy-Printer-App` + campo `zuppy_printer_app`) — ver
+ *     PRINTER_APP_IDENTITY_HEADER
  */
 
 import express, { Request, Response, NextFunction } from 'express'
@@ -43,6 +46,40 @@ const log = createLogger('HTTP')
 export const HTTP_PORT = DEFAULT_LOCAL_PORT
 export const HTTP_HOST = '127.0.0.1'
 
+// ─── Identidade do app ────────────────────────────────────────────────────────
+
+/**
+ * Marcador que diz "quem respondeu aqui é o app de impressão da Zuppy".
+ *
+ * Por que existe: desde que o Zuppy passou a SONDAR a faixa 7847..7850 para
+ * achar as instâncias desta máquina, "respondeu 200 num GET /status com JSON"
+ * deixou de provar qualquer coisa — qualquer processo sem privilégio da
+ * máquina do dono pode escutar numa porta livre da faixa e devolver um
+ * `{"status":"not_configured"}` convincente. Se a 7847 estiver muda, esse
+ * impostor vira a instância principal e o auto-pareamento manda o
+ * `device_token` da loja PARA ELE — a credencial que registra qualquer
+ * computador como impressora daquele restaurante e dá acesso ao stream de
+ * pedidos com nome, telefone e endereço dos clientes.
+ *
+ * O marcador não é segredo nenhum (está neste repositório e no README): ele
+ * não impede um atacante que ESTUDOU o app de imitá-lo. Ele elimina o caso
+ * real — o processo qualquer que só devolve JSON na porta e seria promovido a
+ * impressora por acidente.
+ *
+ * Vai em DOIS lugares, header e corpo, porque o consumidor checa os dois: o
+ * header não aparece num JSON copiado/cacheado por engano, e o corpo
+ * sobrevive a proxy que reescreve header.
+ *
+ * O valor é a VERSÃO do contrato de identificação, não um booleano: se um dia
+ * o formato do `/status` mudar de forma incompatível, o outro lado distingue
+ * pelo número em vez de adivinhar pelo `version` do app.
+ */
+export const PRINTER_APP_IDENTITY_HEADER = 'X-Zuppy-Printer-App'
+export const PRINTER_APP_IDENTITY_VERSION = 1
+
+/** Campo do corpo que carrega o mesmo marcador do header. */
+export const PRINTER_APP_IDENTITY_FIELD = 'zuppy_printer_app'
+
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
 const corsOptions: cors.CorsOptions = {
@@ -61,6 +98,10 @@ const corsOptions: cors.CorsOptions = {
   },
   methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  // Sem isto o header de identidade existe na resposta mas o JS da página do
+  // Zuppy não consegue LER: header de resposta cross-origin fora da safelist
+  // só chega ao `fetch` se estiver no Access-Control-Expose-Headers.
+  exposedHeaders: [PRINTER_APP_IDENTITY_HEADER],
   credentials: true,
 }
 
@@ -304,7 +345,9 @@ function buildRouter(port: number) {
 
   /** GET /ping */
   router.get('/ping', (_req: Request, res: Response) => {
-    res.json({ ok: true })
+    // `ok` continua sendo o campo do health check de sempre; o marcador entra
+    // ao lado (ver PRINTER_APP_IDENTITY_HEADER).
+    res.json({ ok: true, [PRINTER_APP_IDENTITY_FIELD]: PRINTER_APP_IDENTITY_VERSION })
   })
 
   /** GET /status */
@@ -314,6 +357,10 @@ function buildRouter(port: number) {
     const logs = getLogs()
 
     res.json({
+      // Marcador de identidade (ver PRINTER_APP_IDENTITY_HEADER). Primeiro
+      // campo do corpo de propósito: é o que o Zuppy checa antes de tratar
+      // esta porta como uma impressora da loja.
+      [PRINTER_APP_IDENTITY_FIELD]: PRINTER_APP_IDENTITY_VERSION,
       status: isConfigured()
         ? getConnectionStatus()
           ? 'connected'
@@ -321,7 +368,12 @@ function buildRouter(port: number) {
         : 'not_configured',
       version: electronApp.getVersion(),
       printer: cfg.printer_name ?? null,
-      paper_size: cfg.paper_size ?? '80mm',
+      // Só os dois valores que a impressora entende. O que decide a largura
+      // real já é `cfg.paper_size === '58mm' ? 58 : 80` (electron/printer.ts);
+      // ecoar aqui um terceiro valor que algum /configure antigo tenha gravado
+      // diria ao Zuppy uma largura que este app não usa — e reprovaria o app
+      // na validação de forma do outro lado.
+      paper_size: cfg.paper_size === '58mm' ? '58mm' : '80mm',
       queue: queueStatus.length,
       lastPrint: logs[0] ?? null,
       tenant_name: cfg.tenant_name ?? null,
@@ -527,6 +579,15 @@ function buildExpressApp(port: number): express.Express {
       res.status(403).json({ error: 'bad host' })
       return
     }
+    next()
+  })
+
+  // Identidade em TODA resposta que este servidor chega a servir (o 403 de
+  // `Host` acima fica de fora de propósito: request de DNS rebinding não
+  // merece nem o eco). Um único lugar, para que nenhum endpoint novo nasça
+  // anônimo — ver PRINTER_APP_IDENTITY_HEADER.
+  expressApp.use((_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader(PRINTER_APP_IDENTITY_HEADER, String(PRINTER_APP_IDENTITY_VERSION))
     next()
   })
 

@@ -13,6 +13,8 @@
  *     tenant_id — não o api_url) zera a sessão.
  *   - isAllowedLocalHostHeader: só o loopback pode ser o `Host` da requisição,
  *     que é o que denuncia um DNS rebinding.
+ *   - o marcador de identidade do app (header + campo do corpo), congelado
+ *     aqui porque o nome exato é contrato com o servidor do Zuppy.
  *
  * `http-server.ts` importa `electron` (app.getVersion no /status) e, via
  * `./store`, o `electron-store` — ambos exigem rodar dentro do Electron.
@@ -48,6 +50,9 @@ const {
   PRINT_RAW_MAX_DECODED_BYTES,
   planConfigureUpdate,
   isAllowedLocalHostHeader,
+  PRINTER_APP_IDENTITY_HEADER,
+  PRINTER_APP_IDENTITY_FIELD,
+  PRINTER_APP_IDENTITY_VERSION,
 } = await import('./http-server')
 
 const ESC_POS_INIT = Buffer.from([0x1b, 0x40])
@@ -491,5 +496,17 @@ describe('isAllowedLocalHostHeader', () => {
       expect(isAllowedLocalHostHeader(`localhost:${porta}`, porta)).toBe(true)
       expect(isAllowedLocalHostHeader('localhost:7847', porta)).toBe(porta === 7847)
     }
+  })
+})
+
+describe('marcador de identidade do app', () => {
+  it('nome e valor são contrato com o Zuppy — mudar aqui é mudar dos dois lados', () => {
+    // O Zuppy sonda 7847..7850 e valida ESTAS strings para decidir se a porta
+    // é uma impressora da loja (e, portanto, se pode receber o device_token).
+    // Renomear qualquer uma sem atualizar o servidor faz o app novo ser
+    // tratado como impostor.
+    expect(PRINTER_APP_IDENTITY_HEADER).toBe('X-Zuppy-Printer-App')
+    expect(PRINTER_APP_IDENTITY_FIELD).toBe('zuppy_printer_app')
+    expect(PRINTER_APP_IDENTITY_VERSION).toBe(1)
   })
 })

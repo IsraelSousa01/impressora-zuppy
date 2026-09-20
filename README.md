@@ -130,11 +130,36 @@ origem, então o destino continua o do último pareamento.
 
 | Método | Rota           | Descrição                              |
 |--------|----------------|----------------------------------------|
-| GET    | `/ping`        | Health check → `{ ok: true }`         |
+| GET    | `/ping`        | Health check → `{ ok: true, zuppy_printer_app: 1 }` |
 | GET    | `/status`      | Status atual da conexão e fila         |
 | POST   | `/configure`   | Pareia o app (tenant, device_token, api_url) |
 | GET    | `/printers`    | Lista impressoras instaladas           |
 | POST   | `/test-print`  | Imprime página de teste                |
+
+### Como o Zuppy reconhece este app
+
+O Zuppy **sonda** as portas 7847→7850 para achar as instâncias desta máquina.
+"Respondeu 200 com JSON" não prova nada: qualquer programa sem privilégio pode
+escutar numa porta livre da faixa e responder parecido — e o auto-pareamento
+mandaria o `device_token` da loja para ele. Por isso toda resposta servida por
+este app se identifica, em dois lugares:
+
+| Onde   | Nome                        | Valor |
+|--------|-----------------------------|-------|
+| Header | `X-Zuppy-Printer-App`       | `1`   |
+| Corpo  | `zuppy_printer_app` (`/status` e `/ping`) | `1`   |
+
+- O valor é a **versão do contrato de identificação**, não um booleano.
+- O header vai em **todas** as respostas do servidor local (menos o `403` de
+  `Host` inválido) e está no `Access-Control-Expose-Headers`, senão o JS da
+  página do Zuppy não conseguiria lê-lo.
+- **Não é segredo**: está aqui e no código. Ele elimina o impostor acidental —
+  o processo qualquer que só devolve JSON na porta —, não um atacante que
+  estudou o app.
+- **Aditivo**: nenhum campo do `/status` mudou de nome ou de sentido. O app
+  antigo, que não tem o marcador, continua sendo aceito na **7847** (a porta
+  histórica, onde o Zuppy mantém a confiança herdada); o marcador é exigido nas
+  portas novas, onde app antigo nunca sobe — ele não aceita `--port`.
 
 ### POST /configure — Payload
 
@@ -162,11 +187,40 @@ Só `device_token` é obrigatório (string não vazia; sem ele, `400`). Os demai
 - **Ausente = limpa o valor salvo** e o app volta ao default de produção (`https://www.zuppyfood.com.br`). O app segue quem o pareou por último.
 - Mudar `device_token` ou `tenant_id` invalida a sessão atual e força re-autenticação. Mudar só o `api_url` **não** zera a sessão: ela é emitida pelo backend, não pelo host, e um host que não a reconheça devolve `401` no poll seguinte, que já re-autentica.
 
-`GET /status` ecoa o valor salvo em `api_url` (`null` quando é o default) e,
-de forma aditiva, `port` (a porta efetiva desta instância), `destination` (a
-impressora nomeada deste `device_token`, `null` no token legado da loja) e
-`display_name` ("Cozinha — Podrão"). `tenant_name` continua significando a
-**loja**.
+### GET /status — Resposta
+
+```json
+{
+  "zuppy_printer_app": 1,
+  "status": "connected",
+  "version": "1.3.0",
+  "printer": "EPSON TM-T20",
+  "paper_size": "80mm",
+  "queue": 0,
+  "lastPrint": null,
+  "tenant_name": "Podrão",
+  "tenant_id": "uuid",
+  "port": 7848,
+  "destination": { "id": "uuid", "name": "Cozinha", "purpose": "kitchen" },
+  "display_name": "Cozinha — Podrão",
+  "api_url": null,
+  "connected": true,
+  "update": { "updateReady": false, "version": null, "downloadedAt": null }
+}
+```
+
+- `zuppy_printer_app` — marcador de identidade (acima); o mesmo valor do header
+  `X-Zuppy-Printer-App`.
+- `version` — a versão do `package.json` deste app (`app.getVersion()`).
+- `paper_size` — **sempre** `"80mm"` ou `"58mm"`: é a largura que este app de
+  fato usa para imprimir, então qualquer outro valor que tenha sido gravado na
+  config é ecoado como `"80mm"` (o mesmo default do renderizador).
+- `api_url` — origem salva no pareamento; `null` quando é o default de produção.
+- `port` — a porta **efetiva** desta instância (a máquina pode ter mais de uma).
+- `destination` — a impressora nomeada deste `device_token`; `null` no token
+  legado da loja.
+- `display_name` — "Cozinha — Podrão". `tenant_name` continua significando a
+  **loja**.
 
 ## Configuração de Ícone
 
@@ -186,6 +240,7 @@ Configure `electron-builder.yml` com seu repositório GitHub e crie releases nor
 
 - Servidor HTTP vincula apenas a `127.0.0.1` (nunca `0.0.0.0`)
 - Header `Host` aceito só como `127.0.0.1:<porta efetiva>` ou `localhost:<porta efetiva>`; qualquer outro → `403 { "error": "bad host" }` (barra DNS rebinding, que chega como same-origin e passa longe do CORS). A porta comparada é a porta em que **esta** instância escuta, não a 7847 fixa
+- Toda resposta servida carrega o header `X-Zuppy-Printer-App: 1`, e o `/status` e o `/ping` repetem o marcador no corpo (`zuppy_printer_app: 1`): é o que impede que um processo qualquer escutando numa porta da faixa 7847→7850 seja promovido a impressora da loja e receba o `device_token` no auto-pareamento (ver *Como o Zuppy reconhece este app*)
 - O `device_token` nunca vai inteiro para o log — só os 4 últimos caracteres (`maskDeviceToken`); `session_token` não é logado nem mascarado
 - CORS liberado apenas para `https://zuppyfood.com.br`, qualquer subdomínio de `zuppyfood.com.br` (em qualquer profundidade: `gestordepedidos.`, `dev.`, `www.`…), `http://localhost[:porta]` e `http://127.0.0.1[:porta]` — `isAllowedZuppyOrigin` em `electron/config.ts`, a mesma lista que valida o `api_url` do `/configure`
 - Os destinos `localhost`/`127.0.0.1` valem como `api_url` só em build de desenvolvimento; no app empacotado, nunca
