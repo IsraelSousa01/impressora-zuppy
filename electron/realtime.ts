@@ -29,6 +29,7 @@ import { maybeInstallOnSafeWindow, isStoreClosedPollInterval } from './updater'
 import type { RenderedComanda } from './printer'
 import { createLogger } from './logger'
 import { resolveApiBaseUrl } from './config'
+import { parsePrinterDestination, type PrinterDestination } from './destination'
 
 const log = createLogger('JOBS-POLL')
 
@@ -118,6 +119,94 @@ export function parseRetryAfterMs(header: string | null, nowMs: number = Date.no
 
 // ─── Authentication ───────────────────────────────────────────────────────────
 
+/** Sessão emitida pelo POST /api/printer/auth para um device_token. */
+export interface PrinterSession {
+  session_token: string
+  expires_at: string
+  tenant_id: string
+  tenant_name: string
+  auto_print: boolean
+  /** Impressora nomeada deste token; `null` no token legado da loja. */
+  destination: PrinterDestination | null
+}
+
+/** Falha do handshake com o status HTTP preservado, quando houve resposta. */
+export class PrinterAuthError extends Error {
+  constructor(message: string, readonly httpStatus: number | null) {
+    super(message)
+    this.name = 'PrinterAuthError'
+  }
+}
+
+/**
+ * Troca UM device_token por uma sessão no servidor. Não lê nem grava o store:
+ * é o handshake cru, para o loop de polling (que usa o token já pareado) e
+ * para o pareamento manual (que precisa validar um código colado ANTES de
+ * gravar qualquer coisa).
+ *
+ * Lança `PrinterAuthError` em qualquer desfecho que não seja sessão emitida.
+ */
+export async function requestPrinterSession(
+  deviceToken: string,
+  opts: { apiBaseUrl: string; paperSize?: '80mm' | '58mm'; columns?: number }
+): Promise<PrinterSession> {
+  const url = `${opts.apiBaseUrl}/api/printer/auth`
+  let res: Response
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      // O corpo leva o device_token: seguir um redirect reenviaria o segredo
+      // pro destino da redireção. O endpoint legítimo nunca redireciona (a
+      // base já é canonizada na gravação do pareamento) — se redirecionar,
+      // é erro, não caminho feliz.
+      redirect: 'error',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        device_token: deviceToken,
+        paper_size: opts.paperSize,
+        // Versão do app instalada nesta loja — fonte canônica do Electron
+        // (a mesma que o /status local reporta). Campo OPCIONAL no servidor:
+        // servidor antigo simplesmente ignora. Sem isto é impossível saber
+        // quais lojas rodam versão velha (2 de 3 ficaram na 1.0.7, em
+        // streaming ~91% mais caro, sem ninguém perceber).
+        app_version: app.getVersion(),
+        // `columns` só vai quando o usuário calibrou de verdade (ver
+        // AppConfig.columns em store.ts) — nunca inferido a partir de
+        // paper_size. Mandar um palpite como se fosse medição é o erro que
+        // o servidor foi corrigido para não cometer.
+        ...(opts.columns !== undefined && { columns: opts.columns }),
+      }),
+    })
+  } catch (err) {
+    // Sem resposta: DNS, offline, TLS, redirect barrado. Não é token errado.
+    throw new PrinterAuthError(err instanceof Error ? err.message : String(err), null)
+  }
+
+  if (!res.ok) {
+    const errText = (await res.text().catch(() => '')).slice(0, MAX_LOGGED_BODY_CHARS)
+    throw new PrinterAuthError(`Auth API returned ${res.status}: ${errText}`, res.status)
+  }
+
+  const data = (await res.json()) as {
+    session_token: string
+    expires_at: string
+    tenant_id: string
+    tenant_name: string
+    auto_print: boolean
+    /** Aditivo: servidor antigo (ou token legado da loja) não manda. */
+    destination?: unknown
+  }
+
+  return {
+    session_token: data.session_token,
+    expires_at: data.expires_at,
+    tenant_id: data.tenant_id,
+    tenant_name: data.tenant_name,
+    auto_print: data.auto_print,
+    destination: parsePrinterDestination(data.destination),
+  }
+}
+
 /**
  * Exchanges the stored device_token for a temporary session_token.
  * Returns true if successful.
@@ -131,54 +220,28 @@ async function authenticate(): Promise<boolean> {
 
   try {
     log.info('Exchanging device_token for printer session_token…')
-    const url = `${resolveApiBaseUrl(cfg)}/api/printer/auth`
-    const res = await fetch(url, {
-      method: 'POST',
-      // O corpo leva o device_token: seguir um redirect reenviaria o segredo
-      // pro destino da redireção. O endpoint legítimo nunca redireciona (a
-      // base já é canonizada na gravação do pareamento) — se redirecionar,
-      // é erro, não caminho feliz.
-      redirect: 'error',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        device_token: cfg.device_token,
-        paper_size: cfg.paper_size,
-        // Versão do app instalada nesta loja — fonte canônica do Electron
-        // (a mesma que o /status local reporta). Campo OPCIONAL no servidor:
-        // servidor antigo simplesmente ignora. Sem isto é impossível saber
-        // quais lojas rodam versão velha (2 de 3 ficaram na 1.0.7, em
-        // streaming ~91% mais caro, sem ninguém perceber).
-        app_version: app.getVersion(),
-        // `columns` só vai quando o usuário calibrou de verdade (ver
-        // AppConfig.columns em store.ts) — nunca inferido a partir de
-        // paper_size. Mandar um palpite como se fosse medição é o erro que
-        // o servidor foi corrigido para não cometer.
-        ...(cfg.columns !== undefined && { columns: cfg.columns }),
-      }),
+    const session = await requestPrinterSession(cfg.device_token, {
+      apiBaseUrl: resolveApiBaseUrl(cfg),
+      paperSize: cfg.paper_size,
+      columns: cfg.columns,
     })
-
-    if (!res.ok) {
-      const errText = (await res.text().catch(() => '')).slice(0, MAX_LOGGED_BODY_CHARS)
-      throw new Error(`Auth API returned ${res.status}: ${errText}`)
-    }
-
-    const data = (await res.json()) as {
-      session_token: string
-      expires_at: string
-      tenant_id: string
-      tenant_name: string
-      auto_print: boolean
-    }
 
     setConfig({
-      session_token: data.session_token,
-      session_expires_at: data.expires_at,
-      tenant_id: data.tenant_id,
-      tenant_name: data.tenant_name,
-      auto_print: data.auto_print,
+      session_token: session.session_token,
+      session_expires_at: session.expires_at,
+      tenant_id: session.tenant_id,
+      tenant_name: session.tenant_name,
+      auto_print: session.auto_print,
+      // Sempre reescrito (inclusive para `null`): quem diz a que impressora
+      // este token pertence é o servidor. Um destino gravado que o servidor
+      // não confirma mais não pode sobreviver na bandeja.
+      destination: session.destination,
     })
 
-    log.info(`Authenticated successfully for tenant ${data.tenant_name} (${data.tenant_id})`)
+    log.info(
+      `Authenticated successfully for tenant ${session.tenant_name} (${session.tenant_id})` +
+        (session.destination ? ` — impressora "${session.destination.name}"` : '')
+    )
     return true
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)

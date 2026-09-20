@@ -17,7 +17,7 @@
  *     duplo.
  *
  * `updater.ts` importa `./print-queue` → `./store`, que instancia
- * `electron-store` no topo do módulo (exige Electron) — mocka-se igual aos
+ * `electron-store` na primeira leitura (exige Electron) — mocka-se igual aos
  * outros testes. `electron-updater` é mockado pra capturar o quitAndInstall
  * sem Electron (o updater.ts só o carrega via import dinâmico em installNow).
  */

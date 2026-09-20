@@ -7,9 +7,9 @@
  * em que o servidor montou os bytes) com a largura real desta estação.
  *
  * `print-queue.ts` importa `./printer` → `./store`, que instancia
- * `electron-store` no topo do módulo — e `electron-store` exige rodar
- * dentro do Electron (ou receber `projectName`) pra resolver o diretório de
- * dados. Mocka-se o módulo aqui só pra permitir o import fora do Electron;
+ * `electron-store` na primeira leitura de config — e `electron-store` exige
+ * rodar dentro do Electron (ou receber `projectName`) pra resolver o diretório
+ * de dados. Mocka-se o módulo aqui só pra permitir o import fora do Electron;
  * `decideRenderPath` em si não toca o store (recebe `stationCols` já
  * resolvido como parâmetro).
  */

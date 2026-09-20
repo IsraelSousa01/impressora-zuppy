@@ -481,4 +481,15 @@ describe('isAllowedLocalHostHeader', () => {
     expect(isAllowedLocalHostHeader(undefined, PORTA)).toBe(false)
     expect(isAllowedLocalHostHeader('', PORTA)).toBe(false)
   })
+
+  it('porta por instância: vale a porta em que ESTA instância escuta', () => {
+    // A segunda impressora da máquina sobe em 7848+. A comparação é com a
+    // porta efetiva — aceitar a 7847 aqui deixaria uma instância responder
+    // por outra, e exigir a 7847 devolveria 403 para todo request legítimo.
+    for (const porta of [7847, 7848, 7849, 7850]) {
+      expect(isAllowedLocalHostHeader(`127.0.0.1:${porta}`, porta)).toBe(true)
+      expect(isAllowedLocalHostHeader(`localhost:${porta}`, porta)).toBe(true)
+      expect(isAllowedLocalHostHeader('localhost:7847', porta)).toBe(porta === 7847)
+    }
+  })
 })
