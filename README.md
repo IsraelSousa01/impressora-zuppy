@@ -62,6 +62,7 @@ impressora-zuppy/
 │   ├── realtime.ts      # Polling de print jobs na API do Zuppy
 │   ├── print-queue.ts   # Fila de impressão com retry
 │   ├── printer.ts       # ESC/POS via node-thermal-printer
+│   ├── windows-printer-list.ts # Lista as impressoras do Windows (PowerShell, sem wmic)
 │   ├── tray.ts          # Ícone na bandeja do sistema
 │   ├── store.ts         # electron-store (config + logs)
 │   ├── instance.ts      # Porta e profile desta instância (puro)
@@ -133,7 +134,7 @@ origem, então o destino continua o do último pareamento.
 | GET    | `/ping`        | Health check → `{ ok: true, zuppy_printer_app: 1 }` |
 | GET    | `/status`      | Status atual da conexão e fila         |
 | POST   | `/configure`   | Pareia o app (tenant, device_token, api_url) |
-| GET    | `/printers`    | Lista impressoras instaladas           |
+| GET    | `/printers`    | Lista impressoras instaladas → `{ printers, error }` |
 | POST   | `/test-print`  | Imprime página de teste                |
 
 ### Como o Zuppy reconhece este app
@@ -193,8 +194,9 @@ Só `device_token` é obrigatório (string não vazia; sem ele, `400`). Os demai
 {
   "zuppy_printer_app": 1,
   "status": "connected",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "printer": "EPSON TM-T20",
+  "printer_list_error": null,
   "paper_size": "80mm",
   "queue": 0,
   "lastPrint": null,
@@ -212,6 +214,9 @@ Só `device_token` é obrigatório (string não vazia; sem ele, `400`). Os demai
 - `zuppy_printer_app` — marcador de identidade (acima); o mesmo valor do header
   `X-Zuppy-Printer-App`.
 - `version` — a versão do `package.json` deste app (`app.getVersion()`).
+- `printer_list_error` — motivo da última falha ao listar as impressoras do
+  Windows; `null` quando a listagem funcionou (ou ainda não foi tentada). Lista
+  vazia **com** motivo é falha de enumeração, não máquina sem impressora.
 - `paper_size` — **sempre** `"80mm"` ou `"58mm"`: é a largura que este app de
   fato usa para imprimir, então qualquer outro valor que tenha sido gravado na
   config é ecoado como `"80mm"` (o mesmo default do renderizador).

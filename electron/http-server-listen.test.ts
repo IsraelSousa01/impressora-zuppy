@@ -12,7 +12,13 @@
  *     distingue duas impressoras na mesma máquina;
  *   - as respostas se identificam como este app (header + campo no corpo), que
  *     é o que impede um processo qualquer escutando numa porta da faixa de ser
- *     promovido a impressora da loja e receber o device_token.
+ *     promovido a impressora da loja e receber o device_token — inclusive as
+ *     rotas que não existiam quando o marcador nasceu (o `/printers` que passou
+ *     a devolver o erro da enumeração, e qualquer rota futura).
+ *
+ * O módulo `./printer` é mockado: o `/printers` de verdade chama o PowerShell
+ * da máquina (`Get-Printer`), e o que este arquivo testa é o servidor, não a
+ * enumeração — essa tem teste próprio em windows-printer-list.test.ts.
  *
  * Usa portas altas (45800+) de propósito: a 7847 pode estar ocupada pelo app
  * de verdade rodando nesta máquina, e o teste não pode depender disso.
@@ -43,6 +49,23 @@ vi.mock('electron-store', () => {
   }
   return { default: MockElectronStore }
 })
+
+/**
+ * Enumeração de impressoras controlada pelo teste. `error` != null com lista
+ * vazia é o caso que motivou a correção: Windows 11 sem `wmic` devolvia lista
+ * vazia e o dono não conseguia escolher impressora nenhuma.
+ */
+const enumeracao = vi.hoisted(() => ({
+  printers: ['EPSON TM-T20'] as string[],
+  error: null as string | null,
+}))
+
+vi.mock('./printer', () => ({
+  enumeratePrinters: async () => ({ printers: enumeracao.printers, error: enumeracao.error }),
+  getPrinterEnumerationError: () => enumeracao.error,
+  testPrint: async () => undefined,
+  printRawDocument: async () => undefined,
+}))
 
 const { startHttpServer, stopHttpServer, getBoundPort } = await import('./http-server')
 const { setConfig } = await import('./store')
@@ -99,6 +122,8 @@ function get(
 const ocupadas: net.Server[] = []
 
 afterEach(async () => {
+  enumeracao.printers = ['EPSON TM-T20']
+  enumeracao.error = null
   await stopHttpServer()
   while (ocupadas.length > 0) {
     await fecharServidor(ocupadas.pop()!)
@@ -249,6 +274,7 @@ describe('identidade do app nas respostas', () => {
       'status',
       'version',
       'printer',
+      'printer_list_error',
       'paper_size',
       'queue',
       'lastPrint',
@@ -278,5 +304,53 @@ describe('identidade do app nas respostas', () => {
     const { body } = await get(porta, '/status')
 
     expect((JSON.parse(body) as Record<string, unknown>).paper_size).toBe('80mm')
+  })
+
+  it('GET /printers: lista servida com o marcador, na forma nova (printers + error)', async () => {
+    // A rota mudou de forma DEPOIS do marcador nascer (passou a devolver
+    // `error`). Se a identidade estivesse em cada rota, e não num middleware,
+    // é aqui que ela teria sumido.
+    const porta = PORTA_BASE + 45
+    await startHttpServer([porta])
+
+    const { status, body, headers } = await get(porta, '/printers')
+
+    expect(status).toBe(200)
+    expect(headers['x-zuppy-printer-app']).toBe('1')
+    expect(JSON.parse(body)).toEqual({ printers: ['EPSON TM-T20'], error: null })
+  })
+
+  it('falha ao listar impressoras: /printers e /status contam o motivo', async () => {
+    // Lista vazia SEM motivo seria lida como "esta máquina não tem impressora";
+    // com o motivo, a tela pede o nome digitado em vez de mentir.
+    enumeracao.printers = []
+    enumeracao.error = 'Get-Printer não encontrado'
+
+    const porta = PORTA_BASE + 46
+    await startHttpServer([porta])
+
+    const printers = await get(porta, '/printers')
+    expect(JSON.parse(printers.body)).toEqual({
+      printers: [],
+      error: 'Get-Printer não encontrado',
+    })
+
+    const status = await get(porta, '/status')
+    expect((JSON.parse(status.body) as Record<string, unknown>).printer_list_error).toBe(
+      'Get-Printer não encontrado'
+    )
+  })
+
+  it('rota que não existe também se identifica: nenhuma resposta nasce anônima', async () => {
+    // O marcador vem de um middleware único, antes do router. Congelar o 404
+    // aqui é o que garante que uma rota ADICIONADA amanhã já nasça marcada,
+    // sem ninguém lembrar de marcá-la.
+    const porta = PORTA_BASE + 47
+    await startHttpServer([porta])
+
+    const { status, headers } = await get(porta, '/rota-que-nao-existe')
+
+    expect(status).toBe(404)
+    expect(headers['x-zuppy-printer-app']).toBe('1')
   })
 })

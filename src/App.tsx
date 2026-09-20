@@ -52,6 +52,7 @@ declare global {
       getConfig: () => Promise<AppConfig>
       getLogs: () => Promise<PrintLog[]>
       getPrinters: () => Promise<string[]>
+      enumeratePrinters: () => Promise<{ printers: string[]; error: string | null }>
       saveConfig: (patch: Partial<AppConfig>) => Promise<{ ok: boolean }>
       testPrint: (printerName?: string) => Promise<{ ok: boolean }>
       onUpdate: (cb: (event: string, data: unknown) => void) => () => void
@@ -142,6 +143,8 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig>({})
   const [logs, setLogs] = useState<PrintLog[]>([])
   const [printers, setPrinters] = useState<string[]>([])
+  const [printersError, setPrintersError] = useState<string | null>(null)
+  const [manualPrinter, setManualPrinter] = useState('')
   const [loading, setLoading] = useState(true)
   const [testPrinting, setTestPrinting] = useState(false)
   const [testResult, setTestResult] = useState<string | null>(null)
@@ -167,10 +170,12 @@ export default function App() {
 
   const loadPrinters = useCallback(async () => {
     try {
-      const list = await window.zuppy.getPrinters()
+      const { printers: list, error } = await window.zuppy.enumeratePrinters()
       setPrinters(list)
+      setPrintersError(error)
     } catch (err) {
       console.error('Failed to load printers', err)
+      setPrintersError(err instanceof Error ? err.message : String(err))
     }
   }, [])
 
@@ -200,6 +205,15 @@ export default function App() {
     const printer_name = e.target.value
     setConfig((c) => ({ ...c, printer_name }))
     await window.zuppy.saveConfig({ printer_name })
+    await refresh()
+  }
+
+  async function handleManualPrinterSave() {
+    const printer_name = manualPrinter.trim()
+    if (!printer_name) return
+    setConfig((c) => ({ ...c, printer_name }))
+    await window.zuppy.saveConfig({ printer_name })
+    setManualPrinter('')
     await refresh()
   }
 
@@ -341,6 +355,9 @@ export default function App() {
                   style={{ flex: 1 }}
                 >
                   <option value="">— Selecionar impressora —</option>
+                  {config.printer_name && !printers.includes(config.printer_name) && (
+                    <option value={config.printer_name}>{config.printer_name}</option>
+                  )}
                   {printers.map((p) => (
                     <option key={p} value={p}>
                       {p}
@@ -353,6 +370,32 @@ export default function App() {
                   title="Atualizar lista"
                 >
                   🔄
+                </button>
+              </div>
+              {printersError && (
+                <p style={{ fontSize: 12, color: '#fbbf24', marginTop: 8 }}>
+                  Não foi possível listar as impressoras do Windows ({printersError}). Digite o
+                  nome exatamente como aparece em Configurações › Impressoras.
+                </p>
+              )}
+              {!printersError && printers.length === 0 && (
+                <p style={{ fontSize: 12, color: '#94a3b8', marginTop: 8 }}>
+                  Nenhuma impressora instalada no Windows. Se ela já aparece lá, digite o nome abaixo.
+                </p>
+              )}
+              <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                <input
+                  value={manualPrinter}
+                  onChange={(e) => setManualPrinter(e.target.value)}
+                  placeholder="Ou digite o nome da impressora"
+                  style={{ flex: 1 }}
+                />
+                <button
+                  onClick={handleManualPrinterSave}
+                  disabled={!manualPrinter.trim()}
+                  style={{ background: '#334155', color: '#f1f5f9', padding: '6px 12px' }}
+                >
+                  Usar
                 </button>
               </div>
             </div>

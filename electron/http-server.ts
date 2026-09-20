@@ -31,7 +31,12 @@ import { isAllowedZuppyOrigin, canonicalizeZuppyApiOrigin } from './config'
 import { getConnectionStatus, connect, disconnect } from './realtime'
 import { getQueueStatus } from './print-queue'
 import { getUpdateState, installNow } from './updater'
-import { listPrinters, testPrint, printRawDocument } from './printer'
+import {
+  enumeratePrinters,
+  getPrinterEnumerationError,
+  testPrint,
+  printRawDocument,
+} from './printer'
 import { createLogger, maskDeviceToken } from './logger'
 import { formatDeviceLabel } from './destination'
 import { DEFAULT_LOCAL_PORT } from './instance'
@@ -368,6 +373,8 @@ function buildRouter(port: number) {
         : 'not_configured',
       version: electronApp.getVersion(),
       printer: cfg.printer_name ?? null,
+      // Motivo da última falha ao listar impressoras; `null` = listagem ok/ainda não tentada.
+      printer_list_error: getPrinterEnumerationError(),
       // Só os dois valores que a impressora entende. O que decide a largura
       // real já é `cfg.paper_size === '58mm' ? 58 : 80` (electron/printer.ts);
       // ecoar aqui um terceiro valor que algum /configure antigo tenha gravado
@@ -446,8 +453,9 @@ function buildRouter(port: number) {
   /** GET /printers */
   router.get('/printers', async (_req: Request, res: Response) => {
     try {
-      const printers = await listPrinters()
-      res.json({ printers })
+      // `error` != null com `printers: []` = falha ao listar, não ausência de impressoras.
+      const { printers, error } = await enumeratePrinters()
+      res.json({ printers, error })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       log.error('Failed to list printers', err)
