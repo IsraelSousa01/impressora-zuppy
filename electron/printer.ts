@@ -17,14 +17,13 @@ import {
   CharacterSet,
   BreakLine,
 } from 'node-thermal-printer'
-import { exec, spawn, type ChildProcessWithoutNullStreams } from 'child_process'
-import { promisify } from 'util'
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 import { createLogger } from './logger'
 import { getConfig } from './store'
 import { ZUPPY_APP_URL } from './config'
 import { layoutTwoColumns, wrapText, doubleWidthColumns } from './text-layout'
+import { enumerateWindowsPrinters, type PrinterEnumeration } from './windows-printer-list'
 
-const execAsync = promisify(exec)
 const log = createLogger('PRINTER')
 
 /**
@@ -790,27 +789,25 @@ export async function buildOperationalTicketBytes(
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-/**
- * Returns the list of installed printer names from Windows.
- * Uses `wmic` as a fallback when the Electron API is unavailable.
- */
+let lastPrinterEnumerationError: string | null = null
+
+/** Motivo da última falha ao listar impressoras (`null` = última listagem funcionou). */
+export function getPrinterEnumerationError(): string | null {
+  return lastPrinterEnumerationError
+}
+
+/** Lista as impressoras do Windows e informa se a enumeração falhou. */
+export async function enumeratePrinters(): Promise<PrinterEnumeration> {
+  const result = await enumerateWindowsPrinters(undefined, (command, error) => {
+    log.error(`Failed to list printers with ${command}`, error)
+  })
+  lastPrinterEnumerationError = result.error
+  return result
+}
+
+/** Returns the list of installed printer names from Windows. */
 export async function listPrinters(): Promise<string[]> {
-  try {
-    // electron.webContents can list printers from the main process via
-    // BrowserWindow, but we can also shell out to wmic for simplicity.
-    const { stdout } = await execAsync(
-      'wmic printer get name /format:list',
-      { timeout: 8000 },
-    )
-    const names = stdout
-      .split('\n')
-      .map((l) => l.replace(/^Name=/, '').trim())
-      .filter((l) => l.length > 0)
-    return names
-  } catch (err) {
-    log.error('Failed to list printers via wmic', err)
-    return []
-  }
+  return (await enumeratePrinters()).printers
 }
 
 /**

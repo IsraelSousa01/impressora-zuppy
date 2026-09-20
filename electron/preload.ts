@@ -20,6 +20,9 @@ const api = {
   /** List available Windows printers */
   getPrinters: () => ipcRenderer.invoke('get-printers'),
 
+  /** List printers and report whether the enumeration failed */
+  enumeratePrinters: () => ipcRenderer.invoke('enumerate-printers'),
+
   /** Save updated configuration */
   saveConfig: (patch: Record<string, unknown>) =>
     ipcRenderer.invoke('save-config', patch),
