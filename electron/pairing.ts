@@ -15,7 +15,7 @@
  * aparece em log — só mascarado, como no POST /configure.
  */
 
-import { clipboard } from 'electron'
+import { app, clipboard } from 'electron'
 
 import { getConfig, setConfig } from './store'
 import { resolveApiBaseUrl } from './config'
@@ -123,6 +123,12 @@ export async function pairWithCode(rawCode: string | null | undefined): Promise<
       tenant_name: session.tenant_name,
       auto_print: session.auto_print,
       destination: session.destination,
+      // Versão reportada por ESTE handshake (requestPrinterSession manda
+      // `app_version`). Gravada junto com a sessão pelo mesmo motivo de
+      // electron/realtime.ts: é ela que diz se o app atualizou desde então —
+      // e, sem gravar aqui, o primeiro tick depois do pareamento refaria o
+      // handshake à toa.
+      session_app_version: app.getVersion(),
     })
 
     const label = formatDeviceLabel({

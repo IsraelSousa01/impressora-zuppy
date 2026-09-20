@@ -138,6 +138,9 @@ describe('pairWithCode', () => {
     expect(cfg.session_token).toBe('sess-abc')
     expect(cfg.tenant_name).toBe('Podrão')
     expect(cfg.destination).toEqual(SESSAO_COZINHA.destination)
+    // A versão vai junto da sessão: é o que o servidor acabou de registrar e o
+    // que evita o polling refazer este mesmo handshake no tick seguinte.
+    expect(cfg.session_app_version).toBe('0.0.0-test')
 
     // Mesma sequência do POST /configure: derruba o loop antigo e sobe o novo.
     expect(disconnect).toHaveBeenCalledOnce()

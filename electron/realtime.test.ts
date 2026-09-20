@@ -12,6 +12,10 @@
  *     polling e o pareamento manual dividem — o campo ADITIVO `destination`
  *     (impressora nomeada, ausente no token legado da loja) e a distinção
  *     entre "servidor recusou" e "não deu pra falar com o servidor".
+ *   - isSessionFromOtherAppVersion + o loop: depois de o app se atualizar, o
+ *     servidor só aprende a versão nova se houver um handshake novo — e esse
+ *     handshake não pode custar requisição a quem NÃO atualizou, nem virar
+ *     loop na frota que ainda não tem a versão guardada.
  *
  * `realtime.ts` importa `electron` (app.getVersion no handshake de auth) e,
  * via `./store`/`./print-queue`, o `electron-store` — ambos exigem rodar
@@ -21,9 +25,14 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
+import type { AppConfig } from './store'
+
+/** Versão "instalada" nesta máquina de teste — mutável, porque o app atualiza. */
+const versaoDoApp = vi.hoisted(() => ({ atual: '0.0.0-test' }))
+
 vi.mock('electron', () => ({
   app: {
-    getVersion: () => '0.0.0-test',
+    getVersion: () => versaoDoApp.atual,
   },
 }))
 
@@ -43,8 +52,16 @@ vi.mock('electron-store', () => {
   return { default: MockElectronStore }
 })
 
-const { resolveNextPollIntervalMs, parseRetryAfterMs, requestPrinterSession, PrinterAuthError } =
-  await import('./realtime')
+const {
+  resolveNextPollIntervalMs,
+  parseRetryAfterMs,
+  requestPrinterSession,
+  PrinterAuthError,
+  isSessionFromOtherAppVersion,
+  connect,
+  disconnect,
+} = await import('./realtime')
+const { getConfig, setConfig } = await import('./store')
 
 describe('resolveNextPollIntervalMs', () => {
   it('ausente (undefined): mantém o último valor conhecido', () => {
@@ -205,5 +222,157 @@ describe('requestPrinterSession — handshake POST /api/printer/auth', () => {
 
     expect(erro).toBeInstanceOf(PrinterAuthError)
     expect((erro as InstanceType<typeof PrinterAuthError>).httpStatus).toBeNull()
+  })
+})
+
+describe('isSessionFromOtherAppVersion — a sessão guardada foi emitida por outra versão?', () => {
+  const COM_SESSAO = { session_token: 'sess-boa' }
+
+  it('versão igual à guardada: nada a refazer', () => {
+    expect(
+      isSessionFromOtherAppVersion({ ...COM_SESSAO, session_app_version: '1.3.1' }, '1.3.1')
+    ).toBe(false)
+  })
+
+  it('app atualizou desde o handshake: o servidor está com a versão velha', () => {
+    expect(
+      isSessionFromOtherAppVersion({ ...COM_SESSAO, session_app_version: '1.3.0' }, '1.3.1')
+    ).toBe(true)
+  })
+
+  it('sem versão guardada (toda a frota hoje): conta como diferente, para gravar de uma vez', () => {
+    expect(isSessionFromOtherAppVersion(COM_SESSAO, '1.3.1')).toBe(true)
+  })
+
+  it('sem sessão guardada: falso — a autenticação normal já reporta a versão', () => {
+    expect(isSessionFromOtherAppVersion({ session_app_version: '1.3.0' }, '1.3.1')).toBe(false)
+    expect(isSessionFromOtherAppVersion({}, '1.3.1')).toBe(false)
+  })
+})
+
+describe('polling: reportar a versão nova sem custar requisição a quem não atualizou', () => {
+  const SESSAO_EMITIDA = {
+    session_token: 'sess-nova',
+    expires_at: '2099-01-01T00:00:00.000Z',
+    tenant_id: 'tenant-1',
+    tenant_name: 'Podrão',
+    auto_print: true,
+  }
+
+  const fetchMock = vi.fn()
+
+  function responder(status: number, body: unknown): Response {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: () => null },
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    } as unknown as Response
+  }
+
+  /** Estado de uma loja que JÁ está imprimindo: é ela que não pode quebrar. */
+  function semearLojaImprimindo(extra: Partial<AppConfig>): void {
+    setConfig({
+      device_token: 'dev-tok-1',
+      printer_name: 'EPSON TM-T20',
+      paper_size: '80mm',
+      tenant_id: 'tenant-1',
+      tenant_name: 'Podrão',
+      session_token: 'sess-boa',
+      session_expires_at: '2099-01-01T00:00:00.000Z',
+      session_app_version: undefined,
+      ...extra,
+    })
+  }
+
+  function chamadas(sufixo: string): Array<[string, RequestInit]> {
+    return fetchMock.mock.calls.filter(([url]) => String(url).endsWith(sufixo)) as Array<
+      [string, RequestInit]
+    >
+  }
+
+  /** Roda `n` ticks do loop: o 1º é imediato, os seguintes a cada 3s. */
+  async function rodarTicks(n: number): Promise<void> {
+    await vi.advanceTimersByTimeAsync(0)
+    for (let i = 1; i < n; i++) await vi.advanceTimersByTimeAsync(3000)
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    fetchMock.mockReset()
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith('/api/printer/auth')
+        ? responder(200, SESSAO_EMITIDA)
+        : responder(200, { jobs: [], next_poll_ms: 3000 })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(async () => {
+    await disconnect()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    versaoDoApp.atual = '0.0.0-test'
+  })
+
+  it('versão igual à guardada: zero handshake — os mesmos requests de hoje', async () => {
+    versaoDoApp.atual = '1.3.1'
+    semearLojaImprimindo({ session_app_version: '1.3.1' })
+
+    await connect()
+    await rodarTicks(3)
+
+    expect(chamadas('/api/printer/auth')).toHaveLength(0)
+    expect(chamadas('/api/printer/jobs')).toHaveLength(3)
+    expect(getConfig().session_token).toBe('sess-boa')
+  })
+
+  it('app atualizou: exatamente UM handshake, com a versão nova no corpo e no store', async () => {
+    versaoDoApp.atual = '1.3.1'
+    semearLojaImprimindo({ session_app_version: '1.3.0' })
+
+    await connect()
+    await rodarTicks(4)
+
+    const handshakes = chamadas('/api/printer/auth')
+    expect(handshakes).toHaveLength(1)
+    expect(JSON.parse(String(handshakes[0][1].body)).app_version).toBe('1.3.1')
+    expect(getConfig().session_app_version).toBe('1.3.1')
+    expect(getConfig().session_token).toBe('sess-nova')
+    // O tick do re-handshake também buscou os jobs: nada de comanda atrasada.
+    expect(chamadas('/api/printer/jobs')).toHaveLength(4)
+  })
+
+  it('sessão sem versão guardada (a frota hoje): um handshake no 1º boot e nada de loop', async () => {
+    versaoDoApp.atual = '1.3.1'
+    semearLojaImprimindo({})
+
+    await connect()
+    await rodarTicks(5)
+
+    expect(chamadas('/api/printer/auth')).toHaveLength(1)
+    expect(chamadas('/api/printer/jobs')).toHaveLength(5)
+    expect(getConfig().session_app_version).toBe('1.3.1')
+  })
+
+  it('handshake recusado: a sessão boa segue imprimindo e não vira tentativa por tick', async () => {
+    versaoDoApp.atual = '1.3.1'
+    semearLojaImprimindo({ session_app_version: '1.3.0' })
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith('/api/printer/auth')
+        ? responder(500, { error: 'boom' })
+        : responder(200, { jobs: [], next_poll_ms: 3000 })
+    )
+
+    await connect()
+    await rodarTicks(4)
+
+    expect(chamadas('/api/printer/auth')).toHaveLength(1)
+    expect(getConfig().session_token).toBe('sess-boa')
+    expect(getConfig().session_app_version).toBe('1.3.0')
+    const jobs = chamadas('/api/printer/jobs')
+    expect(jobs).toHaveLength(4)
+    expect((jobs[0][1].headers as Record<string, string>).Authorization).toBe('Bearer sess-boa')
   })
 })

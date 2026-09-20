@@ -23,6 +23,18 @@ export interface AppConfig {
   session_token: string
   /** Expiration of the session token */
   session_expires_at: string
+  /**
+   * Versão do app que fez o handshake que emitiu a sessão atual — é a que o
+   * servidor gravou em `printer_sessions.app_version` e mostra no painel.
+   *
+   * A sessão dura ~30 dias e é reusada enquanto vale, então o app pode
+   * atualizar várias vezes entre dois handshakes: sem este campo o servidor
+   * ficava com a versão velha (loja com 1.3.1 instalada aparecia como 1.3.0) e
+   * a trava `PRINTER_MIN_APP_VERSION` barraria loja já atualizada. Comparada
+   * com `app.getVersion()` em electron/realtime.ts. Ausente = sessão emitida
+   * antes desta correção.
+   */
+  session_app_version?: string
   /** Windows printer name selected by the user */
   printer_name: string
   /** Thermal paper width */

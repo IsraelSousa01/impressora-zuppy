@@ -19,11 +19,14 @@
  *      fechada). Campo opcional e clampado — ver resolveNextPollIntervalMs.
  *   5. 401 invalida a sessão e re-autentica; 429 respeita Retry-After;
  *      erro de rede/5xx entra em backoff exponencial.
+ *   6. Versão do app diferente da que emitiu a sessão guardada ⇒ UM handshake
+ *      novo, para o servidor registrar a versão que está mesmo instalada
+ *      (ver isSessionFromOtherAppVersion).
  */
 
 import { EventEmitter } from 'events'
 import { app } from 'electron'
-import { getConfig, setConfig, isConfigured } from './store'
+import { getConfig, setConfig, isConfigured, type AppConfig } from './store'
 import { addToQueue, getQueueStatus } from './print-queue'
 import { maybeInstallOnSafeWindow, isStoreClosedPollInterval } from './updater'
 import type { RenderedComanda } from './printer'
@@ -75,6 +78,14 @@ let currentPollIntervalMs = DEFAULT_POLL_INTERVAL_MS
  * garante que nunca existem dois loops de polling simultâneos.
  */
 let pollGeneration = 0
+/**
+ * Já tentamos, neste ciclo de conexão, refazer o handshake por causa de uma
+ * versão nova? Uma tentativa por ciclo basta — o app reinicia ao se atualizar,
+ * e connect() só roda de novo no boot, no /configure ou no pareamento — e é o
+ * que impede que um `/auth` recusado (token revogado, 5xx) vire uma tentativa
+ * a cada tick enquanto a sessão boa segue imprimindo.
+ */
+let appVersionHandshakeAttempted = false
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -236,6 +247,10 @@ async function authenticate(): Promise<boolean> {
       // este token pertence é o servidor. Um destino gravado que o servidor
       // não confirma mais não pode sobreviver na bandeja.
       destination: session.destination,
+      // A versão que ESTE handshake acabou de reportar (requestPrinterSession
+      // manda `app_version` no corpo). Guardada junto com a sessão porque é
+      // ela que diz, no próximo boot, se o app atualizou desde então.
+      session_app_version: app.getVersion(),
     })
 
     log.info(
@@ -249,6 +264,56 @@ async function authenticate(): Promise<boolean> {
     realtimeEvents.emit('error', err)
     return false
   }
+}
+
+// ─── Versão do app reportada ao servidor ──────────────────────────────────────
+
+/**
+ * A sessão guardada foi emitida por OUTRA versão do app?
+ *
+ * O servidor só aprende a versão no handshake (`printer_sessions.app_version`),
+ * e o app reusa o `session_token` salvo enquanto ele vale (~30 dias) — então,
+ * sem esta comparação, o painel mostra a versão de semanas atrás (medido em
+ * produção: lojas em 1.2.0 com sessão de 21 e 27 dias) e a trava
+ * `PRINTER_MIN_APP_VERSION` decidiria sobre um dado mentiroso.
+ *
+ * Sem sessão guardada ⇒ false: o fluxo normal já vai autenticar e reportar.
+ * `session_app_version` ausente ⇒ true: é a frota inteira no primeiro boot
+ * depois desta correção, que faz UM handshake e passa a gravar o campo.
+ */
+export function isSessionFromOtherAppVersion(
+  cfg: Partial<AppConfig>,
+  currentAppVersion: string
+): boolean {
+  if (!cfg.session_token) return false
+  return cfg.session_app_version !== currentAppVersion
+}
+
+/**
+ * Refaz o handshake com o único fim de registrar a versão nova no servidor.
+ *
+ * Nunca lança e nunca descarta a sessão que está imprimindo: `authenticate()`
+ * só toca no store quando o servidor responde, então uma falha aqui deixa a
+ * sessão boa no lugar e o tick segue normalmente — reportar versão jamais pode
+ * custar uma comanda. Falhou, fica para o próximo boot (o app reinicia ao se
+ * atualizar) ou para o re-handshake natural de quando a sessão expirar.
+ */
+async function reauthenticateToReportAppVersion(): Promise<void> {
+  appVersionHandshakeAttempted = true
+  log.info(`App agora na versão ${app.getVersion()}; refazendo o handshake para reportá-la…`)
+
+  try {
+    if (await authenticate()) return
+  } catch (err) {
+    // authenticate() emite 'error' no realtimeEvents e, sem nenhum listener
+    // registrado, o EventEmitter RELANÇA — mesmo motivo do try/catch do tick.
+    log.error(
+      'Re-handshake de versão lançou:',
+      err instanceof Error ? err.message : String(err)
+    )
+  }
+
+  log.warn('Não deu para reportar a versão agora; a sessão atual continua valendo.')
 }
 
 // ─── Poll de jobs pendentes ───────────────────────────────────────────────────
@@ -378,6 +443,16 @@ async function pollTick(generation: number): Promise<void> {
   if (!isClientActive || generation !== pollGeneration) return
 
   let cfg = getConfig()
+
+  // Atualizou desde o handshake que emitiu esta sessão: um handshake novo
+  // (e só um por execução) põe a versão certa no servidor. Sem mudança de
+  // versão, isto é uma comparação de string — nenhuma requisição a mais.
+  if (!appVersionHandshakeAttempted && isSessionFromOtherAppVersion(cfg, app.getVersion())) {
+    await reauthenticateToReportAppVersion()
+    if (!isClientActive || generation !== pollGeneration) return
+    cfg = getConfig()
+  }
+
   if (!cfg.session_token) {
     let authenticated = false
     try {
@@ -464,6 +539,7 @@ export async function connect(): Promise<void> {
 
   log.info('Starting print jobs polling client…')
   consecutiveFailures = 0
+  appVersionHandshakeAttempted = false
   clearPollTimer()
   const generation = ++pollGeneration
 
