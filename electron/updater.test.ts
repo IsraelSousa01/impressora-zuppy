@@ -229,8 +229,9 @@ describe('maybeInstallOnSafeWindow (efeito)', () => {
 
     expect(decision.install).toBe(true)
     // Aguarda o efeito assíncrono terminar DENTRO deste teste — senão a
-    // chamada de quitAndInstall vaza pro teste seguinte.
-    await vi.waitFor(() => expect(quitAndInstall).toHaveBeenCalled())
+    // chamada de quitAndInstall vaza pro teste seguinte. Prazo de 5 s: o
+    // import() do electron-updater passa de 1 s (o padrão) em máquina carregada.
+    await vi.waitFor(() => expect(quitAndInstall).toHaveBeenCalled(), { timeout: 5000 })
   })
 })
 
