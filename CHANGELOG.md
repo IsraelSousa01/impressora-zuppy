@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.1 — papel escolhido no painel
+
+- **O papel da impressora (58mm ou 80mm) pode ser trocado pelo painel do Zuppy**, inclusive em sessão de suporte, sem ninguém no computador da loja. O servidor manda a escolha no poll (`printer_paper_size: { value, set_at }`), e o app troca o papel, descarta a calibração da impressora anterior e refaz o handshake uma vez para o servidor montar a comanda na largura nova.
+- **Cada escolha do painel é aplicada uma vez**: uma troca feita depois no computador da loja continua valendo até a próxima escolha no painel. Só horários do servidor são comparados entre si (relógio errado na loja não muda nada).
+- Sem o campo (servidor antigo, loja sem escolha no painel, impressora nomeada), nada muda em relação à 1.5.0.
+
 ## 1.5.0 — sinal de acordar
 
 O app passa a ouvir um "sinal de acordar" do Zuppy pelo Supabase Realtime. Com o sinal ligado, a comanda sai assim que o pedido é aceito e o app consulta o servidor a cada 30 s em vez de 3 s (cerca de 10 vezes menos requisições por loja). O sinal só liga para as lojas que o Zuppy colocar na flag `PRINTER_WAKE_SIGNAL_*`; nas demais, a 1.5.0 se comporta exatamente como a 1.4.0.

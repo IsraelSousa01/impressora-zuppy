@@ -38,6 +38,7 @@ import type { RenderedComanda } from './printer'
 import { createLogger } from './logger'
 import { resolveApiBaseUrl } from './config'
 import { parsePrinterDestination, type PrinterDestination } from './destination'
+import { decidePanelPaperSize, panelPaperPatch, parsePanelPaperSize } from './paper-sync'
 import {
   WakeController,
   NEXT_POLL_MS_WITH_WAKE,
@@ -136,6 +137,8 @@ let pollGeneration = 0
  * a cada tick enquanto a sessão boa segue imprimindo.
  */
 let appVersionHandshakeAttempted = false
+/** O papel foi trocado pelo painel e o servidor ainda não soube (ver applyPanelPaperSize). */
+let paperHandshakePending = false
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -352,19 +355,26 @@ export function isSessionFromOtherAppVersion(
 async function reauthenticateToReportAppVersion(): Promise<void> {
   appVersionHandshakeAttempted = true
   log.info(`App agora na versão ${app.getVersion()}; refazendo o handshake para reportá-la…`)
+  await reauthenticateKeepingSession('versão')
+}
 
+/**
+ * Handshake novo sem descartar a sessão que está imprimindo (ver acima):
+ * falhou, a sessão atual segue valendo e o tick continua.
+ */
+async function reauthenticateKeepingSession(reason: string): Promise<void> {
   try {
     if (await authenticate()) return
   } catch (err) {
     // authenticate() emite 'error' no realtimeEvents e, sem nenhum listener
     // registrado, o EventEmitter RELANÇA — mesmo motivo do try/catch do tick.
     log.error(
-      'Re-handshake de versão lançou:',
+      `Re-handshake (${reason}) lançou:`,
       err instanceof Error ? err.message : String(err)
     )
   }
 
-  log.warn('Não deu para reportar a versão agora; a sessão atual continua valendo.')
+  log.warn(`Não deu para refazer o handshake (${reason}) agora; a sessão atual continua valendo.`)
 }
 
 // ─── Poll de jobs pendentes ───────────────────────────────────────────────────
@@ -435,6 +445,8 @@ async function fetchAndEnqueuePendingJobs(
     store_closed?: unknown
     wake?: unknown
     wake_missed_recorded?: unknown
+    /** Papel escolhido no painel (1.5.1, ver paper-sync.ts). */
+    printer_paper_size?: unknown
   }
 
   const jobs = Array.isArray(data.jobs) ? data.jobs : []
@@ -466,7 +478,37 @@ async function fetchAndEnqueuePendingJobs(
     pollStartedAtMs,
   })
 
+  // Depois de enfileirar: a troca de papel vale a partir do próximo job
+  // (os já enfileirados decidem a largura na hora de imprimir, com o papel atual).
+  applyPanelPaperSize(data.printer_paper_size)
+
   return { status: 'ok', jobCount: jobs.length }
+}
+
+/**
+ * Papel escolhido no painel: aplica (uma vez por escolha) e pede um
+ * handshake novo para o servidor registrar o papel desta estação. Nunca lança:
+ * papel jamais pode custar uma comanda.
+ */
+function applyPanelPaperSize(raw: unknown): void {
+  try {
+    if (raw === undefined) return
+    const cfg = getConfig()
+    const decision = decidePanelPaperSize({
+      field: parsePanelPaperSize(raw),
+      currentPaperSize: cfg.paper_size,
+      lastAppliedSetAt: cfg.paper_size_panel_set_at,
+    })
+    const patch = panelPaperPatch(decision)
+    if (!patch) return
+    setConfig(patch)
+    if (decision.action === 'apply') {
+      log.info(`Papel trocado pelo painel: ${cfg.paper_size ?? '80mm'} → ${decision.value}`)
+      paperHandshakePending = true
+    }
+  } catch (err) {
+    log.error('Papel do painel (ignorado):', err instanceof Error ? err.message : String(err))
+  }
 }
 
 // ─── Polling loop ─────────────────────────────────────────────────────────────
@@ -648,6 +690,15 @@ async function runPollTick(generation: number, trigger: PollTrigger): Promise<vo
   // versão, isto é uma comparação de string — nenhuma requisição a mais.
   if (!appVersionHandshakeAttempted && isSessionFromOtherAppVersion(cfg, app.getVersion())) {
     await reauthenticateToReportAppVersion()
+    if (!isClientActive || generation !== pollGeneration) return
+    cfg = getConfig()
+  }
+
+  // Papel trocado pelo painel: um handshake novo leva o papel (e a ausência
+  // de calibração) ao servidor, que passa a montar a comanda na largura nova.
+  if (paperHandshakePending && cfg.session_token) {
+    paperHandshakePending = false
+    await reauthenticateKeepingSession('papel trocado pelo painel')
     if (!isClientActive || generation !== pollGeneration) return
     cfg = getConfig()
   }

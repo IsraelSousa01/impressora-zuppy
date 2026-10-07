@@ -40,6 +40,11 @@ export interface AppConfig {
   /** Thermal paper width */
   paper_size: '80mm' | '58mm'
   /**
+   * `set_at` da última escolha de papel feita NO PAINEL que este app já viu
+   * (ver electron/paper-sync.ts). Ausente = nenhuma escolha do painel vista.
+   */
+  paper_size_panel_set_at?: string
+  /**
    * Origem da API do Zuppy que ESTE app chama; `null`/ausente = default de
    * produção. Gravada só pelo POST /configure — o porquê e as regras vivem em
    * `resolveApiBaseUrl` (electron/config.ts).
