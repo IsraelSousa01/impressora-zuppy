@@ -61,6 +61,7 @@ impressora-zuppy/
 │   ├── http-server.ts   # Express em localhost:7847
 │   ├── realtime.ts      # Polling de print jobs na API do Zuppy
 │   ├── wake.ts          # Sinal de acordar (Supabase Realtime) que deixa o poll a 30 s
+│   ├── paper-sync.ts    # Papel (58/80mm) escolhido no painel, aplicado pelo poll
 │   ├── print-queue.ts   # Fila de impressão com retry
 │   ├── printer.ts       # ESC/POS via node-thermal-printer
 │   ├── windows-printer-list.ts # Lista as impressoras do Windows (PowerShell, sem wmic)
@@ -245,6 +246,16 @@ Configure `electron-builder.yml` com seu repositório GitHub e crie releases nor
 O update baixado só é instalado sozinho na "janela segura": loja fechada por horário, fila de impressão vazia e quieta há 60 s. "Loja fechada" vem do `next_poll_ms` do servidor (30 s = fechada) e, desde a 1.5.0, também do `store_closed` quando o servidor o manda (os dois precisam concordar). O ritmo que o próprio app escolhe com o sinal de acordar (30 s) nunca conta.
 
 Lançamento gradual: o `latest.yml` aceita `stagingPercentage: <0-100>`; cada instalação sorteia um número fixo e só atualiza se ele cair dentro do percentual. Para ampliar, edite o `latest.yml` da release (subir o percentual) ou remova a linha. Publique o `latest.yml` **por último**, depois do `.exe` e do `.blockmap`.
+
+## Papel escolhido no painel (1.5.1)
+
+O papel da impressora (58mm ou 80mm) também pode ser trocado pelo painel do Zuppy, sem ninguém no computador da loja. Quando o dono escolhe o papel em Ajustes → Impressão → Papel, o servidor manda no poll `printer_paper_size: { value, set_at }`. O app (`electron/paper-sync.ts`) troca o papel, descarta a calibração local de colunas (era da impressora anterior) e refaz o handshake uma vez.
+
+Cada escolha do painel é aplicada **uma vez**: o app guarda o último `set_at` visto, e uma troca feita depois pelo computador da loja (`POST /configure`) continua valendo até a próxima escolha no painel. Sem o campo, nada muda.
+
+- Toda troca de papel (pelo painel ou pela loja) é levada ao servidor por um handshake novo; se o `/auth` falhar, o app tenta de novo a cada 10 min enquanto o papel da sessão (`session_paper_size`) for diferente do papel atual — nunca a cada poll.
+- Parear o app com outra loja esquece a escolha de papel vista da loja anterior.
+- Reinstalar o app (ou apagar a configuração) faz a última escolha do painel valer de novo: o painel é a fonte quando não há histórico local.
 
 ## Sinal de acordar (1.5.0)
 

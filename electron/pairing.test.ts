@@ -147,6 +147,16 @@ describe('pairWithCode', () => {
     expect(connect).toHaveBeenCalledOnce()
   })
 
+  it('pareou outra loja: esquece a escolha de papel do painel da loja anterior e guarda o papel da sessão', async () => {
+    setConfig({ paper_size: '58mm', paper_size_panel_set_at: '2026-11-10T12:00:00.000Z' })
+    pedirSessao.mockResolvedValueOnce(SESSAO_COZINHA) // tenant-1, antes era tenant-antigo
+
+    await pairWithCode(CODIGO)
+
+    expect(getConfig().paper_size_panel_set_at).toBeUndefined()
+    expect(getConfig().session_paper_size).toBe('58mm')
+  })
+
   it('manda ao handshake o papel e a calibração já gravados', async () => {
     pedirSessao.mockResolvedValueOnce(SESSAO_COZINHA)
     setConfig({ columns: 42 })

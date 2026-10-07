@@ -38,6 +38,7 @@ import type { RenderedComanda } from './printer'
 import { createLogger } from './logger'
 import { resolveApiBaseUrl } from './config'
 import { parsePrinterDestination, type PrinterDestination } from './destination'
+import { decidePanelPaperSize, panelPaperPatch, parsePanelPaperSize, type PaperSize } from './paper-sync'
 import {
   WakeController,
   NEXT_POLL_MS_WITH_WAKE,
@@ -136,6 +137,35 @@ let pollGeneration = 0
  * a cada tick enquanto a sessão boa segue imprimindo.
  */
 let appVersionHandshakeAttempted = false
+/**
+ * Última tentativa de levar o papel ao servidor: para QUAL papel e quando.
+ * Repetir a mesma tentativa espera `PAPER_HANDSHAKE_RETRY_MS`; um papel novo
+ * (outra troca) tenta na hora.
+ */
+let lastPaperHandshakeAttempt: { paperSize: PaperSize; atMs: number } | null = null
+/**
+ * Intervalo entre tentativas de levar o MESMO papel ao servidor enquanto ele
+ * estiver diferente do da sessão: um `/auth` fora do ar não pode virar uma
+ * tentativa por tick, nem deixar o servidor com o papel velho até a sessão expirar.
+ */
+export const PAPER_HANDSHAKE_RETRY_MS = 10 * 60_000
+
+/**
+ * O servidor ainda está com outro papel para esta estação? Sessão sem
+ * `session_paper_size` (emitida antes da 1.5.1) conta como "não sei" ⇒ não:
+ * o handshake de versão da atualização já grava o campo.
+ */
+export function needsPaperHandshake(cfg: Partial<AppConfig>): boolean {
+  if (!cfg.session_token || cfg.session_paper_size === undefined) return false
+  return (cfg.paper_size ?? '80mm') !== cfg.session_paper_size
+}
+
+function shouldAttemptPaperHandshake(cfg: Partial<AppConfig>, nowMs: number): boolean {
+  if (!needsPaperHandshake(cfg)) return false
+  const paperSize = cfg.paper_size ?? '80mm'
+  const last = lastPaperHandshakeAttempt
+  return !last || last.paperSize !== paperSize || nowMs - last.atMs >= PAPER_HANDSHAKE_RETRY_MS
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -302,6 +332,8 @@ async function authenticate(): Promise<boolean> {
       // manda `app_version` no corpo). Guardada junto com a sessão porque é
       // ela que diz, no próximo boot, se o app atualizou desde então.
       session_app_version: app.getVersion(),
+      // O papel que ESTE handshake reportou (mesmo valor de `paperSize` acima).
+      session_paper_size: cfg.paper_size ?? '80mm',
     })
 
     log.info(
@@ -352,19 +384,26 @@ export function isSessionFromOtherAppVersion(
 async function reauthenticateToReportAppVersion(): Promise<void> {
   appVersionHandshakeAttempted = true
   log.info(`App agora na versão ${app.getVersion()}; refazendo o handshake para reportá-la…`)
+  await reauthenticateKeepingSession('versão')
+}
 
+/**
+ * Handshake novo sem descartar a sessão que está imprimindo (ver acima):
+ * falhou, a sessão atual segue valendo e o tick continua.
+ */
+async function reauthenticateKeepingSession(reason: string): Promise<void> {
   try {
     if (await authenticate()) return
   } catch (err) {
     // authenticate() emite 'error' no realtimeEvents e, sem nenhum listener
     // registrado, o EventEmitter RELANÇA — mesmo motivo do try/catch do tick.
     log.error(
-      'Re-handshake de versão lançou:',
+      `Re-handshake (${reason}) lançou:`,
       err instanceof Error ? err.message : String(err)
     )
   }
 
-  log.warn('Não deu para reportar a versão agora; a sessão atual continua valendo.')
+  log.warn(`Não deu para refazer o handshake (${reason}) agora; a sessão atual continua valendo.`)
 }
 
 // ─── Poll de jobs pendentes ───────────────────────────────────────────────────
@@ -435,6 +474,8 @@ async function fetchAndEnqueuePendingJobs(
     store_closed?: unknown
     wake?: unknown
     wake_missed_recorded?: unknown
+    /** Papel escolhido no painel (1.5.1, ver paper-sync.ts). */
+    printer_paper_size?: unknown
   }
 
   const jobs = Array.isArray(data.jobs) ? data.jobs : []
@@ -466,7 +507,42 @@ async function fetchAndEnqueuePendingJobs(
     pollStartedAtMs,
   })
 
+  // Depois de enfileirar: a troca de papel vale a partir do próximo job
+  // (os já enfileirados decidem a largura na hora de imprimir, com o papel atual).
+  applyPanelPaperSize(data.printer_paper_size)
+
   return { status: 'ok', jobCount: jobs.length }
+}
+
+/**
+ * Papel escolhido no painel: aplica (uma vez por escolha) e pede um
+ * handshake novo para o servidor registrar o papel desta estação. Nunca lança:
+ * papel jamais pode custar uma comanda.
+ */
+function applyPanelPaperSize(raw: unknown): void {
+  try {
+    if (raw === undefined) return
+    const cfg = getConfig()
+    const decision = decidePanelPaperSize({
+      field: parsePanelPaperSize(raw),
+      currentPaperSize: cfg.paper_size,
+      lastAppliedSetAt: cfg.paper_size_panel_set_at,
+    })
+    const patch = panelPaperPatch(decision)
+    if (!patch) return
+    if (decision.action === 'apply' && cfg.session_paper_size === undefined) {
+      // Sessão de antes da 1.5.1: o servidor tem o papel que ESTA estação
+      // reportava até agora. Guardá-lo deixa a diferença visível e o handshake
+      // do papel acontece (needsPaperHandshake), sem flag em memória.
+      patch.session_paper_size = cfg.paper_size ?? '80mm'
+    }
+    setConfig(patch)
+    if (decision.action === 'apply') {
+      log.info(`Papel trocado pelo painel: ${cfg.paper_size ?? '80mm'} → ${decision.value}`)
+    }
+  } catch (err) {
+    log.error('Papel do painel (ignorado):', err instanceof Error ? err.message : String(err))
+  }
 }
 
 // ─── Polling loop ─────────────────────────────────────────────────────────────
@@ -652,6 +728,17 @@ async function runPollTick(generation: number, trigger: PollTrigger): Promise<vo
     cfg = getConfig()
   }
 
+  // Papel diferente do que o servidor tem (trocado pelo painel ou pelo
+  // computador da loja): um handshake novo leva o papel (e a ausência de
+  // calibração) ao servidor, que passa a montar a comanda na largura nova.
+  // Falhou, tenta de novo depois de PAPER_HANDSHAKE_RETRY_MS — nunca por tick.
+  if (shouldAttemptPaperHandshake(cfg, Date.now())) {
+    lastPaperHandshakeAttempt = { paperSize: cfg.paper_size ?? '80mm', atMs: Date.now() }
+    await reauthenticateKeepingSession('papel da estação mudou')
+    if (!isClientActive || generation !== pollGeneration) return
+    cfg = getConfig()
+  }
+
   if (!cfg.session_token) {
     let authenticated = false
     try {
@@ -744,6 +831,7 @@ export async function connect(): Promise<void> {
   log.info('Starting print jobs polling client…')
   consecutiveFailures = 0
   appVersionHandshakeAttempted = false
+  lastPaperHandshakeAttempt = null
   pendingOutOfPace = null
   lastTickStartedAtMs = Number.NEGATIVE_INFINITY
   // A janela segura da conexão anterior (outra loja, outro pareamento) não vale.
