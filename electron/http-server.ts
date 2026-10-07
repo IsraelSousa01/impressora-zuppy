@@ -337,6 +337,8 @@ export function planConfigureUpdate(
     ...(identityChanged && {
       session_token: undefined,
       session_expires_at: undefined,
+      // A escolha de papel do painel já vista era da identidade anterior.
+      paper_size_panel_set_at: undefined,
     }),
   }
 

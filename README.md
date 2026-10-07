@@ -253,6 +253,10 @@ O papel da impressora (58mm ou 80mm) também pode ser trocado pelo painel do Zup
 
 Cada escolha do painel é aplicada **uma vez**: o app guarda o último `set_at` visto, e uma troca feita depois pelo computador da loja (`POST /configure`) continua valendo até a próxima escolha no painel. Sem o campo, nada muda.
 
+- Toda troca de papel (pelo painel ou pela loja) é levada ao servidor por um handshake novo; se o `/auth` falhar, o app tenta de novo a cada 10 min enquanto o papel da sessão (`session_paper_size`) for diferente do papel atual — nunca a cada poll.
+- Parear o app com outra loja esquece a escolha de papel vista da loja anterior.
+- Reinstalar o app (ou apagar a configuração) faz a última escolha do painel valer de novo: o painel é a fonte quando não há histórico local.
+
 ## Sinal de acordar (1.5.0)
 
 O poll de `GET /api/printer/jobs` passou a ser rede de segurança. Quando o servidor oferece o campo `wake` (flag `PRINTER_WAKE_SIGNAL_*` do Zuppy ligada para a loja), o app abre um WebSocket no Supabase Realtime (`electron/wake.ts`) e assina o canal `printer-wake:<tópico>` de cada loja que imprime. Qualquer mensagem no canal dispara um poll imediato; com o canal saudável o poll de segurança cai de 3 s para 30 s.

@@ -419,6 +419,9 @@ describe('planConfigureUpdate', () => {
     expect('session_expires_at' in plan.patch).toBe(true)
     expect(plan.patch.session_token).toBeUndefined()
     expect(plan.patch.session_expires_at).toBeUndefined()
+    // A escolha de papel do painel já vista era da loja anterior (1.5.1).
+    expect('paper_size_panel_set_at' in plan.patch).toBe(true)
+    expect(plan.patch.paper_size_panel_set_at).toBeUndefined()
   })
 
   it('tenant_id novo: troca de identidade e sessão zerada explicitamente', () => {

@@ -129,6 +129,10 @@ export async function pairWithCode(rawCode: string | null | undefined): Promise<
       // e, sem gravar aqui, o primeiro tick depois do pareamento refaria o
       // handshake à toa.
       session_app_version: app.getVersion(),
+      session_paper_size: cfg.paper_size ?? '80mm',
+      // Escolha de papel do painel vista é da loja ANTERIOR: a desta loja,
+      // mesmo mais antiga, tem de valer (ver electron/paper-sync.ts).
+      ...(cfg.tenant_id !== session.tenant_id && { paper_size_panel_set_at: undefined }),
     })
 
     const label = formatDeviceLabel({

@@ -45,6 +45,13 @@ export interface AppConfig {
    */
   paper_size_panel_set_at?: string
   /**
+   * Papel (efetivo: ausente = 80mm) com que o handshake da sessão atual foi
+   * feito. Diferente de `paper_size` ⇒ o servidor ainda está com o papel velho
+   * e o app refaz o handshake (ver electron/realtime.ts). Ausente = sessão
+   * emitida antes da 1.5.1.
+   */
+  session_paper_size?: '80mm' | '58mm'
+  /**
    * Origem da API do Zuppy que ESTE app chama; `null`/ausente = default de
    * produção. Gravada só pelo POST /configure — o porquê e as regras vivem em
    * `resolveApiBaseUrl` (electron/config.ts).

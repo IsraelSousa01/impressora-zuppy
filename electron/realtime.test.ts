@@ -62,6 +62,7 @@ const {
   disconnect,
   _setWakeSocketFactoryForTests,
   _getUpdateStoreClosedForTests,
+  PAPER_HANDSHAKE_RETRY_MS,
 } = await import('./realtime')
 const { getConfig, setConfig } = await import('./store')
 const { queueEvents } = await import('./print-queue')
@@ -753,6 +754,7 @@ describe('papel escolhido no painel (1.5.1)', () => {
       session_token: 'sess-boa',
       session_expires_at: '2099-01-01T00:00:00.000Z',
       session_app_version: '1.5.1',
+      session_paper_size: '58mm', // a sessão atual foi emitida com o papel de hoje
     })
     fetchMock.mockReset()
     fetchMock.mockImplementation(async (url: string) =>
@@ -812,13 +814,16 @@ describe('papel escolhido no painel (1.5.1)', () => {
     await ticks(2)
     setConfig({ paper_size: '58mm' }) // alguém trocou no computador da loja
     await ticks(3)
+    // A troca local vale (a mesma escolha do painel não é reaplicada) e é
+    // levada ao servidor por UM handshake, como a do painel.
     expect(getConfig().paper_size).toBe('58mm')
-    expect(handshakes()).toHaveLength(1)
+    expect(handshakes()).toHaveLength(2)
+    expect(JSON.parse(String(handshakes()[1][1].body)).paper_size).toBe('58mm')
 
     papelDoPainel = { value: '80mm', set_at: T2 } // nova escolha no painel
     await ticks(2)
     expect(getConfig().paper_size).toBe('80mm')
-    expect(handshakes()).toHaveLength(2)
+    expect(handshakes()).toHaveLength(3)
   })
 
   it('campo inválido: ignorado sem afetar o poll', async () => {
@@ -844,5 +849,52 @@ describe('papel escolhido no painel (1.5.1)', () => {
     expect(handshakes()).toHaveLength(1)
     expect(getConfig().session_token).toBe('sess-boa')
     expect(getConfig().paper_size).toBe('80mm')
+  })
+
+  it('handshake do papel falhou: tenta de novo depois de 10 min, até o servidor saber', async () => {
+    papelDoPainel = { value: '80mm', set_at: T1 }
+    let authOk = false
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith('/api/printer/auth')
+        ? authOk
+          ? responder(200, {
+              session_token: 'sess-nova',
+              expires_at: '2099-01-01T00:00:00.000Z',
+              tenant_id: 'tenant-1',
+              tenant_name: 'GS',
+              auto_print: true,
+            })
+          : responder(500, { error: 'boom' })
+        : responder(200, { jobs: [], next_poll_ms: 3000, printer_paper_size: papelDoPainel })
+    )
+    await connect()
+    await vi.advanceTimersByTimeAsync(0)
+    await ticks(2)
+    expect(handshakes()).toHaveLength(1)
+    authOk = true
+    await vi.advanceTimersByTimeAsync(PAPER_HANDSHAKE_RETRY_MS)
+    expect(handshakes()).toHaveLength(2)
+    expect(getConfig().session_paper_size).toBe('80mm')
+    await ticks(10)
+    expect(handshakes()).toHaveLength(2) // servidor já sabe: nada mais
+  })
+
+  it('sessão emitida antes da 1.5.1 recebendo escolha do painel: troca e leva ao servidor com 1 handshake', async () => {
+    setConfig({ session_paper_size: undefined })
+    papelDoPainel = { value: '80mm', set_at: T1 }
+    await connect()
+    await vi.advanceTimersByTimeAsync(0)
+    await ticks(4)
+    expect(getConfig().paper_size).toBe('80mm')
+    expect(handshakes()).toHaveLength(1)
+    expect(getConfig().session_paper_size).toBe('80mm')
+  })
+
+  it('sessão emitida antes da 1.5.1 (sem papel guardado) e nenhuma troca: nenhum handshake a mais', async () => {
+    setConfig({ session_paper_size: undefined })
+    await connect()
+    await vi.advanceTimersByTimeAsync(0)
+    await ticks(3)
+    expect(handshakes()).toHaveLength(0)
   })
 })
