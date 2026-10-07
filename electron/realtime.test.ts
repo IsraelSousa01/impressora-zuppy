@@ -60,8 +60,11 @@ const {
   isSessionFromOtherAppVersion,
   connect,
   disconnect,
+  _setWakeSocketFactoryForTests,
 } = await import('./realtime')
 const { getConfig, setConfig } = await import('./store')
+const { queueEvents } = await import('./print-queue')
+type WakeSocketHandlers = import('./wake').WakeSocketHandlers
 
 describe('resolveNextPollIntervalMs', () => {
   it('ausente (undefined): mantém o último valor conhecido', () => {
@@ -374,5 +377,258 @@ describe('polling: reportar a versão nova sem custar requisição a quem não a
     const jobs = chamadas('/api/printer/jobs')
     expect(jobs).toHaveLength(4)
     expect((jobs[0][1].headers as Record<string, string>).Authorization).toBe('Bearer sess-boa')
+  })
+})
+
+describe('polling com o sinal de acordar (1.5.0)', () => {
+  const TOPICO = '11111111-2222-4333-8444-555555555555'
+  const WAKE = {
+    url: 'https://xvloxrouxjrofygpbnyi.supabase.co',
+    anon_key: 'eyJ.anon.key',
+    topics: [{ tenant_id: 'tenant-1', topic: TOPICO }],
+    version: 'v1',
+  }
+
+  interface SocketFalso {
+    handlers: WakeSocketHandlers
+    fechado: boolean
+  }
+
+  const fetchMock = vi.fn()
+  let sockets: SocketFalso[] = []
+  /** Corpo da próxima 200 do poll (o teste troca no meio). */
+  let corpoDoPoll: () => Record<string, unknown> = () => ({ jobs: [], next_poll_ms: 3000 })
+  let statusDoPoll = 200
+
+  function responder(status: number, body: unknown): Response {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      headers: { get: () => null },
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    } as unknown as Response
+  }
+
+  function polls(): Array<[string, RequestInit]> {
+    return fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/api/printer/jobs')) as Array<
+      [string, RequestInit]
+    >
+  }
+
+  function headerDoUltimoPoll(nome: string): string | undefined {
+    const todos = polls()
+    return (todos[todos.length - 1][1].headers as Record<string, string>)[nome]
+  }
+
+  /** Loja com o sinal ligado: 1º poll entrega o wake, o canal entra, o socket fica saudável. */
+  async function ligarSinal(): Promise<SocketFalso> {
+    corpoDoPoll = () => ({
+      jobs: [],
+      next_poll_ms: 3000,
+      next_poll_ms_with_wake: 30000,
+      store_closed: false,
+      wake: WAKE,
+    })
+    await connect()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(sockets).toHaveLength(1)
+    sockets[0].handlers.onChannelStatus(0, 'SUBSCRIBED')
+    // Daqui em diante o servidor responde só { version } (o app já tem o conjunto).
+    corpoDoPoll = () => ({ jobs: [], wake: { version: 'v1' } })
+    // O tick que entregou o wake agendou 3 s (o canal ainda não tinha entrado); depois dele, 30 s.
+    await vi.advanceTimersByTimeAsync(3000)
+    return sockets[0]
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    sockets = []
+    statusDoPoll = 200
+    corpoDoPoll = () => ({ jobs: [], next_poll_ms: 3000 })
+    _setWakeSocketFactoryForTests((_config, handlers) => {
+      const socket: SocketFalso = { handlers, fechado: false }
+      sockets.push(socket)
+      return {
+        close() {
+          socket.fechado = true
+        },
+      }
+    })
+    fetchMock.mockReset()
+    fetchMock.mockImplementation(async () => responder(statusDoPoll, corpoDoPoll()))
+    vi.stubGlobal('fetch', fetchMock)
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+    versaoDoApp.atual = '1.5.0'
+    setConfig({
+      device_token: 'dev-tok-1',
+      printer_name: 'EPSON TM-T20',
+      paper_size: '80mm',
+      tenant_id: 'tenant-1',
+      tenant_name: 'Podrão',
+      session_token: 'sess-boa',
+      session_expires_at: '2099-01-01T00:00:00.000Z',
+      session_app_version: '1.5.0',
+    })
+  })
+
+  afterEach(async () => {
+    await disconnect()
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    versaoDoApp.atual = '0.0.0-test'
+  })
+
+  it('todo poll manda X-Printer-App-Version e X-Printer-Wake (state=off sem sinal)', async () => {
+    await connect()
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(polls()).toHaveLength(2)
+    for (const [, init] of polls()) {
+      const headers = init.headers as Record<string, string>
+      expect(headers['X-Printer-App-Version']).toBe('1.5.0')
+      expect(headers['X-Printer-Wake']).toBe('v=;state=off;missed=0')
+      expect(headers.Authorization).toBe('Bearer sess-boa')
+    }
+  })
+
+  it('resposta sem wake (flag desligada): ritmo de hoje, idêntico à 1.4.0', async () => {
+    await connect()
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(polls()).toHaveLength(11) // 0, 3, 6, …, 30 s
+    expect(sockets).toHaveLength(0)
+  })
+
+  it('sinal saudável: o poll de segurança vai a 30 s e o header diz joined com a versão', async () => {
+    await ligarSinal()
+    const depoisDeLigar = polls().length
+    await vi.advanceTimersByTimeAsync(29_999)
+    expect(polls()).toHaveLength(depoisDeLigar)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(polls()).toHaveLength(depoisDeLigar + 1)
+    expect(headerDoUltimoPoll('X-Printer-Wake')).toBe('v=v1;state=joined;missed=0')
+  })
+
+  it('matar o WebSocket volta ao ritmo de hoje em 1 ciclo (poll com jitter de 0 a 5 s, depois 3 s)', async () => {
+    const socket = await ligarSinal()
+    const antes = polls().length
+    await vi.advanceTimersByTimeAsync(10_000) // no meio da espera de 30 s
+    socket.handlers.onChannelStatus(0, 'CLOSED')
+    await vi.advanceTimersByTimeAsync(2499)
+    expect(polls()).toHaveLength(antes)
+    await vi.advanceTimersByTimeAsync(1) // jitter = 0,5 × 5 s
+    expect(polls()).toHaveLength(antes + 1)
+    expect(headerDoUltimoPoll('X-Printer-Wake')).toBe('v=v1;state=degraded;missed=0')
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(polls()).toHaveLength(antes + 2)
+  })
+
+  it('sinais simultâneos geram 1 GET (e o poll vazio do sinal ganha UM repoll em 2 s)', async () => {
+    const socket = await ligarSinal()
+    await vi.advanceTimersByTimeAsync(5000)
+    const antes = polls().length
+    socket.handlers.onSignal()
+    socket.handlers.onSignal()
+    socket.handlers.onSignal()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(polls()).toHaveLength(antes + 1)
+    await vi.advanceTimersByTimeAsync(1999)
+    expect(polls()).toHaveLength(antes + 1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(polls()).toHaveLength(antes + 2) // repoll único
+    await vi.advanceTimersByTimeAsync(29_999)
+    expect(polls()).toHaveLength(antes + 2) // depois, o ritmo de segurança
+  })
+
+  it('poll do sinal com comanda: sem repoll', async () => {
+    const socket = await ligarSinal()
+    await vi.advanceTimersByTimeAsync(5000)
+    const antes = polls().length
+    corpoDoPoll = () => ({
+      jobs: [{ id: 'job-1', order_id: 'o-1', order: null, wake_expected: true }],
+      wake: { version: 'v1' },
+    })
+    socket.handlers.onSignal()
+    await vi.advanceTimersByTimeAsync(0)
+    corpoDoPoll = () => ({ jobs: [], wake: { version: 'v1' } })
+    await vi.advanceTimersByTimeAsync(29_999)
+    expect(polls()).toHaveLength(antes + 1)
+  })
+
+  it('enxurrada de sinais: no máximo 1 poll a cada 2 s', async () => {
+    const socket = await ligarSinal()
+    const antes = polls().length
+    for (let i = 0; i < 100; i++) {
+      socket.handlers.onSignal()
+      await vi.advanceTimersByTimeAsync(100)
+    }
+    // 10 s de enxurrada ⇒ 5 GETs (um a cada 2 s).
+    expect(polls().length - antes).toBeLessThanOrEqual(6)
+    expect(polls().length - antes).toBeGreaterThanOrEqual(4)
+  })
+
+  it('sinal com um poll em voo: vira UM poll quando ele terminar', async () => {
+    const socket = await ligarSinal()
+    let liberar: () => void = () => {}
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          liberar = () => resolve(responder(200, corpoDoPoll()))
+        })
+    )
+    await vi.advanceTimersByTimeAsync(30_000) // dispara o poll de segurança, que fica pendurado
+    const emVoo = polls().length
+    socket.handlers.onSignal()
+    socket.handlers.onSignal()
+    expect(polls()).toHaveLength(emVoo)
+    liberar()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(polls()).toHaveLength(emVoo + 1)
+  })
+
+  it('sinal durante backoff de erro: não fura a espera (nem Retry-After)', async () => {
+    const socket = await ligarSinal()
+    statusDoPoll = 500
+    await vi.advanceTimersByTimeAsync(30_000) // poll de segurança falha ⇒ backoff de 2 s
+    const antes = polls().length
+    socket.handlers.onSignal()
+    await vi.advanceTimersByTimeAsync(1999)
+    expect(polls()).toHaveLength(antes)
+  })
+
+  it('duas respostas sem wake: desliga o socket, volta a 3 s e manda v= vazio', async () => {
+    const socket = await ligarSinal()
+    corpoDoPoll = () => ({ jobs: [], next_poll_ms: 3000 })
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(socket.fechado).toBe(false)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(socket.fechado).toBe(true)
+    const antes = polls().length
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(polls()).toHaveLength(antes + 1)
+    expect(headerDoUltimoPoll('X-Printer-Wake')).toBe('v=;state=off;missed=0')
+  })
+
+  it('401: desliga o socket junto com a sessão', async () => {
+    const socket = await ligarSinal()
+    statusDoPoll = 401
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(socket.fechado).toBe(true)
+  })
+
+  it('falha de impressão reportada: repoll em 2 s mesmo com o poll a 30 s', async () => {
+    await ligarSinal()
+    const antes = polls().length
+    queueEvents.emit('jobDone', { jobId: 'job-1', status: 'failed' })
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(polls()).toHaveLength(antes + 1)
+  })
+
+  it('disconnect: fecha o socket', async () => {
+    const socket = await ligarSinal()
+    await disconnect()
+    expect(socket.fechado).toBe(true)
   })
 })

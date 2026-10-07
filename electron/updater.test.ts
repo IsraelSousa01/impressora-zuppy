@@ -48,6 +48,7 @@ vi.mock('electron-updater', () => ({
 const {
   shouldInstallNow,
   isStoreClosedPollInterval,
+  isStoreClosedForUpdate,
   isQueueQuiet,
   registerDownloadedUpdate,
   getUpdateState,
@@ -121,6 +122,26 @@ describe('isStoreClosedPollInterval', () => {
 
   it('logo abaixo de 30s: na dúvida, aberta (nunca instalar é o erro barato)', () => {
     expect(isStoreClosedPollInterval(29999)).toBe(false)
+  })
+})
+
+describe('isStoreClosedForUpdate — janela segura com o store_closed do servidor (1.5.0)', () => {
+  it('sem store_closed (servidor antigo, loja fora da flag): a regra da 1.4.0, nada muda', () => {
+    expect(isStoreClosedForUpdate(null, 3000)).toBe(false)
+    expect(isStoreClosedForUpdate(null, 30000)).toBe(true)
+  })
+
+  it('loja aberta (store_closed false): não libera, mesmo com o ritmo de 30 s', () => {
+    expect(isStoreClosedForUpdate(false, 30000)).toBe(false)
+    expect(isStoreClosedForUpdate(false, 3000)).toBe(false)
+  })
+
+  it('loja fechada pelo servidor E ritmo de loja fechada: libera', () => {
+    expect(isStoreClosedForUpdate(true, 30000)).toBe(true)
+  })
+
+  it('store_closed sozinho não libera (sessão de conta: ele olha só a loja host)', () => {
+    expect(isStoreClosedForUpdate(true, 3000)).toBe(false)
   })
 })
 

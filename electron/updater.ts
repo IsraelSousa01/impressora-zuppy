@@ -15,7 +15,8 @@
  *
  * Sinais (quem os fornece é realtime.ts, após cada poll bem-sucedido):
  *  - storeClosed: o servidor dita o ritmo do polling via `next_poll_ms`
- *    (3s com a loja ativa, 30s fechada) — ritmo >= 30s ⇒ loja fechada.
+ *    (3s com a loja ativa, 30s fechada) — ritmo >= 30s ⇒ loja fechada. Desde
+ *    a 1.5.0, também o `store_closed` do servidor (ver isStoreClosedForUpdate).
  *  - queueEmpty: fila local de impressão sem jobs (print-queue.ts).
  *  - queueQuiet: derivado AQUI, dos eventos da fila. Existe porque
  *    `getQueueStatus().length === 0` mente durante uma impressão: o
@@ -116,6 +117,28 @@ export function shouldInstallNow(signals: InstallSignals): InstallDecision {
 /** Ritmo de poll >= o de loja fechada ⇒ loja fechada. Na dúvida, aberta. */
 export function isStoreClosedPollInterval(pollIntervalMs: number): boolean {
   return pollIntervalMs >= STORE_CLOSED_POLL_INTERVAL_MS
+}
+
+/**
+ * Loja fechada para fins de atualização (1.5.0).
+ *
+ * `serverPollIntervalMs` é o `next_poll_ms` do SERVIDOR, nunca o ritmo que o
+ * app escolheu: com o sinal de acordar saudável o app polla a 30 s com a loja
+ * aberta, e a regra antiga leria isso como "fechada".
+ *
+ *  - Sem `store_closed` (servidor antigo, loja fora da flag): regra da 1.4.0.
+ *  - Com `store_closed`: precisa dos DOIS (`store_closed` e o ritmo de loja
+ *    fechada). Os dois olham só a loja host numa sessão de conta (limitação do
+ *    servidor), então o `store_closed` sozinho não pode liberar instalação: a
+ *    conjunção nunca é mais permissiva que a 1.4.0.
+ */
+export function isStoreClosedForUpdate(
+  storeClosedField: boolean | null,
+  serverPollIntervalMs: number
+): boolean {
+  const closedByPace = isStoreClosedPollInterval(serverPollIntervalMs)
+  if (storeClosedField === null) return closedByPace
+  return storeClosedField && closedByPace
 }
 
 /** A fila está sem atividade há pelo menos a janela de silêncio? */
