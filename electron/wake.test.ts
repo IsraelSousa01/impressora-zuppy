@@ -45,6 +45,7 @@ const {
   MISSED_PENALTY_MS,
   HEARTBEAT_STALE_MS,
   WAKE_STUCK_RECREATE_MS,
+  wakeStuckLimitMs,
 } = await import('./wake')
 type WakeSocketHandlers = import('./wake').WakeSocketHandlers
 type WakeSocketConfig = import('./wake').WakeSocketConfig
@@ -523,14 +524,58 @@ describe('WakeController', () => {
       expect(sockets).toHaveLength(1)
     })
 
-    it('queda longa: uma tentativa nova a cada ~2 min, nunca uma rajada', () => {
+    it('queda longa: o limite dobra a cada recriação (2, 4, 8 min…), nunca uma rajada', () => {
       const { sockets, responder } = criarControlador()
       responder(wakeCompleto())
       vi.advanceTimersByTime(10 * 60_000)
-      // 600 s / (120 s + até 5 s de cadência do tick) ⇒ 4 ou 5 recriações.
-      expect(sockets.length - 1).toBeGreaterThanOrEqual(4)
-      expect(sockets.length - 1).toBeLessThanOrEqual(5)
+      // Recria em ~120 s e ~360 s (120 + 240); a próxima só em ~840 s.
+      expect(sockets.length - 1).toBe(2)
+      vi.advanceTimersByTime(5 * 60_000) // 900 s
+      expect(sockets.length - 1).toBe(3)
       expect(sockets.slice(0, -1).every((s) => s.closed)).toBe(true)
+    })
+
+    it('o socket recriado entrando zera o backoff: a próxima queda volta a esperar só ~2 min', () => {
+      const { sockets, responder } = criarControlador()
+      responder(wakeCompleto())
+      vi.advanceTimersByTime(WAKE_STUCK_RECREATE_MS + 5_000)
+      vi.advanceTimersByTime(2 * WAKE_STUCK_RECREATE_MS + 5_000)
+      expect(sockets).toHaveLength(3)
+      sockets[2].joinAll()
+      sockets[2].handlers.onChannelStatus(0, 'CHANNEL_ERROR')
+      vi.advanceTimersByTime(WAKE_STUCK_RECREATE_MS + 5_000)
+      expect(sockets).toHaveLength(4)
+    })
+
+    it('canal oscilando (entra e cai entre dois ticks): a entrada zera o contador na hora', () => {
+      const { sockets, responder } = criarControlador()
+      responder(wakeCompleto())
+      vi.advanceTimersByTime(WAKE_STUCK_RECREATE_MS - 10_000)
+      sockets[0].handlers.onChannelStatus(0, 'SUBSCRIBED')
+      sockets[0].handlers.onChannelStatus(0, 'CHANNEL_ERROR')
+      vi.advanceTimersByTime(20_000)
+      expect(sockets).toHaveLength(1)
+    })
+
+    it('handlers do socket descartado ficam inertes', () => {
+      const { controller, sockets, sinais, responder } = criarControlador()
+      responder(wakeCompleto())
+      vi.advanceTimersByTime(WAKE_STUCK_RECREATE_MS + 5_000)
+      expect(sockets).toHaveLength(2)
+      sockets[0].joinAll()
+      sockets[0].handlers.onSignal()
+      sockets[0].handlers.onHeartbeat('ok')
+      expect(controller.state()).toBe('degraded')
+      expect(sinais).toHaveLength(0)
+    })
+
+    it('wakeStuckLimitMs: 120 s, dobrando até 30 min, mais jitter de até 30 s', () => {
+      expect(wakeStuckLimitMs(0, () => 0)).toBe(120_000)
+      expect(wakeStuckLimitMs(1, () => 0)).toBe(240_000)
+      expect(wakeStuckLimitMs(3, () => 0)).toBe(960_000)
+      expect(wakeStuckLimitMs(4, () => 0)).toBe(30 * 60_000)
+      expect(wakeStuckLimitMs(50, () => 0)).toBe(30 * 60_000)
+      expect(wakeStuckLimitMs(0, () => 0.5)).toBe(135_000)
     })
   })
 

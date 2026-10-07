@@ -80,10 +80,21 @@ const HEALTH_CHECK_INTERVAL_MS = 5_000
 /**
  * Watchdog: tempo máximo fora de `joined` antes de recriar o socket. Acima do
  * maior degrau do reconnect do realtime-js (60 s + jitter), para não brigar com
- * uma reconexão legítima; mais um jitter de até 30 s.
+ * uma reconexão legítima; mais um jitter de até 30 s. Dobra a cada recriação
+ * seguida sem entrar (cada cliente novo recomeça o próprio backoff com várias
+ * tentativas), até `WAKE_STUCK_RECREATE_MAX_MS`; zera quando o sinal entra.
  */
 export const WAKE_STUCK_RECREATE_MS = 120_000
+export const WAKE_STUCK_RECREATE_MAX_MS = 30 * 60_000
 export const WAKE_STUCK_RECREATE_JITTER_MS = 30_000
+/** Segundo disconnect do cliente fechado (ver `createRealtimeWakeSocket`). */
+const CLOSE_SECOND_DISCONNECT_MS = 15_000
+
+/** Limite do watchdog depois de `recreates` recriações seguidas sem o sinal entrar. */
+export function wakeStuckLimitMs(recreates: number, random: () => number = Math.random): number {
+  const base = Math.min(WAKE_STUCK_RECREATE_MAX_MS, WAKE_STUCK_RECREATE_MS * 2 ** Math.min(Math.max(0, recreates), 10))
+  return base + reconnectJitterMs(random, WAKE_STUCK_RECREATE_JITTER_MS)
+}
 /** Backoff do reconnect do socket (a mais o jitter). */
 const SOCKET_RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000]
 
@@ -252,10 +263,24 @@ function errorName(err: unknown): string {
  * QUALQUER evento. Sem logger do realtime-js (ele loga a URL com a apikey).
  */
 export const createRealtimeWakeSocket: WakeSocketFactory = (config, handlers) => {
+  // Fechado pelo app. O phoenix pode reagendar a reconexão DEPOIS do
+  // disconnect() (callback de um teardown de heartbeat timeout em curso) e
+  // deixar um socket órfão, sem canais, vivo para sempre: com a trava, qualquer
+  // sinal de vida do cliente fechado vira um disconnect.
+  let closed = false
+  const disconnectQuietly = (): void => {
+    client.disconnect().catch((err: unknown) => log.warn(`disconnect do socket falhou (${errorName(err)})`))
+  }
   const client = new RealtimeClient(config.endpoint, {
     params: { apikey: config.anonKey },
     heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
-    heartbeatCallback: (status) => handlers.onHeartbeat(String(status)),
+    heartbeatCallback: (status) => {
+      if (closed) {
+        disconnectQuietly()
+        return
+      }
+      handlers.onHeartbeat(String(status))
+    },
     reconnectAfterMs: (tries: number) =>
       (SOCKET_RECONNECT_DELAYS_MS[tries - 1] ?? SOCKET_RECONNECT_DELAYS_MS[SOCKET_RECONNECT_DELAYS_MS.length - 1]) +
       reconnectJitterMs(),
@@ -269,8 +294,12 @@ export const createRealtimeWakeSocket: WakeSocketFactory = (config, handlers) =>
   })
   return {
     close() {
+      closed = true
       client.removeAllChannels().catch((err: unknown) => log.warn(`removeAllChannels falhou (${errorName(err)})`))
-      client.disconnect().catch((err: unknown) => log.warn(`disconnect do socket falhou (${errorName(err)})`))
+      disconnectQuietly()
+      // Segundo disconnect depois da janela do teardown (~1,5 s) do phoenix,
+      // para o caso de ele ter reagendado a reconexão nesse intervalo.
+      setTimeout(disconnectQuietly, CLOSE_SECOND_DISCONNECT_MS).unref?.()
     },
   }
 }
@@ -326,6 +355,8 @@ export class WakeController {
   private pendingMissed: Array<{ count: number; timer: ReturnType<typeof setTimeout> }> = []
   private healthTimer: ReturnType<typeof setInterval> | null = null
   private lastReportedHealthy = false
+  /** Recriações seguidas do watchdog sem o sinal entrar (dobra o limite; zera ao entrar). */
+  private stuckRecreates = 0
 
   constructor(deps: WakeControllerDeps = {}) {
     this.socketFactory = deps.socketFactory ?? createRealtimeWakeSocket
@@ -387,6 +418,7 @@ export class WakeController {
       this.closeSubscription()
       this.knownVersion = null
       this.absentStreak = 0
+      this.stuckRecreates = 0
     } catch (err) {
       log.error(`Falha ao desligar o sinal: ${errorName(err)}`)
     } finally {
@@ -468,6 +500,7 @@ export class WakeController {
       this.knownVersion = field.version
       return
     }
+    this.stuckRecreates = 0
     this.openSubscription(field)
   }
 
@@ -493,7 +526,7 @@ export class WakeController {
       heartbeatOk: true,
       lastHeartbeatOkAtMs: now,
       notJoinedSinceMs: now,
-      stuckLimitMs: WAKE_STUCK_RECREATE_MS + reconnectJitterMs(Math.random, WAKE_STUCK_RECREATE_JITTER_MS),
+      stuckLimitMs: wakeStuckLimitMs(this.stuckRecreates),
     }
     this.subscription = sub
     try {
@@ -553,8 +586,13 @@ export class WakeController {
         sub.heartbeatOk = true
         sub.lastHeartbeatOkAtMs = sub.joinedSinceMs
         log.info('Sinal ligado')
+        sub.notJoinedSinceMs = null
+        this.stuckRecreates = 0
+        // Entrou: a próxima queda deste socket volta ao limite base.
+        sub.stuckLimitMs = wakeStuckLimitMs(0)
       } else if (!allJoined && wasAllJoined) {
         sub.joinedSinceMs = null
+        sub.notJoinedSinceMs = Date.now()
         log.warn(`Sinal caiu (canal ${status}); poll volta ao ritmo de hoje`)
       }
     } catch (err) {
@@ -605,14 +643,15 @@ export class WakeController {
    * não sofre (o poll fica no ritmo de hoje), mas a loja perderia o sinal até
    * reiniciar o app. Fora de `joined` por mais que `stuckLimitMs`, descarta o
    * cliente e abre um novo com o mesmo `wake`. Numa queda longa do Realtime,
-   * isso é uma tentativa nova a cada ~2–2,5 min por app (jitter evita a frota em
-   * sincronia).
+   * o limite dobra a cada recriação seguida (2, 4, 8… até 30 min, com jitter),
+   * porque cada cliente novo recomeça o próprio backoff de reconexão.
    */
   private recreateIfStuck(now: number = Date.now()): void {
     const sub = this.subscription
     if (!sub) return
     if (this.state(now) === 'joined') {
       sub.notJoinedSinceMs = null
+      this.stuckRecreates = 0
       return
     }
     if (sub.notJoinedSinceMs === null) {
@@ -621,7 +660,8 @@ export class WakeController {
     }
     const stuckForMs = now - sub.notJoinedSinceMs
     if (stuckForMs < sub.stuckLimitMs) return
-    log.warn(`Sinal fora do ar há ${Math.round(stuckForMs / 1000)} s; recriando o socket`)
+    this.stuckRecreates++
+    log.warn(`Sinal fora do ar há ${Math.round(stuckForMs / 1000)} s; recriando o socket (tentativa ${this.stuckRecreates})`)
     this.openSubscription(sub.field)
   }
 
