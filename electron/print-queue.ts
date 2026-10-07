@@ -284,9 +284,11 @@ async function processJob(job: PrintJob): Promise<void> {
       log.error(`Job ${job.id} exceeded max retries, dropping`)
 
       // Notify backend so it marks the job as failed (not stuck as pending)
-      confirmFailed(job.id, message).catch((e) =>
-        log.warn(`Failed to confirm job failure on backend: ${e}`)
-      )
+      confirmFailed(job.id, message)
+        .catch((e) => log.warn(`Failed to confirm job failure on backend: ${e}`))
+        // Depois do PATCH (com sucesso ou não): o servidor pode ter devolvido o
+        // job a `pending`, sem sinal de acordar — realtime.ts repolla curto.
+        .finally(() => queueEvents.emit('jobFailureReported', { jobId: job.id }))
 
       logPrintResult({
         id: job.id,

@@ -488,6 +488,9 @@ export class WakeController {
     } catch (err) {
       log.error(`Não deu para abrir o socket do sinal (${errorName(err)}); poll segue no ritmo de hoje`)
       this.subscription = null
+      // Esquece a versão: o próximo poll pede o conjunto completo e tenta de
+      // novo. Guardá-la deixaria a loja sem sinal, em silêncio, até a versão mudar.
+      this.knownVersion = null
     }
   }
 

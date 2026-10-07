@@ -61,6 +61,7 @@ const {
   connect,
   disconnect,
   _setWakeSocketFactoryForTests,
+  _getUpdateStoreClosedForTests,
 } = await import('./realtime')
 const { getConfig, setConfig } = await import('./store')
 const { queueEvents } = await import('./print-queue')
@@ -618,12 +619,93 @@ describe('polling com o sinal de acordar (1.5.0)', () => {
     expect(socket.fechado).toBe(true)
   })
 
-  it('falha de impressão reportada: repoll em 2 s mesmo com o poll a 30 s', async () => {
+  it('falha de impressão reportada (PATCH concluído): repoll em 2 s mesmo com o poll a 30 s', async () => {
+    await ligarSinal()
+    const antes = polls().length
+    queueEvents.emit('jobFailureReported', { jobId: 'job-1' })
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(polls()).toHaveLength(antes + 1)
+  })
+
+  it('jobDone failed sozinho (PATCH ainda em voo) não repolla: espera o fim da confirmação', async () => {
     await ligarSinal()
     const antes = polls().length
     queueEvents.emit('jobDone', { jobId: 'job-1', status: 'failed' })
     await vi.advanceTimersByTimeAsync(2000)
-    expect(polls()).toHaveLength(antes + 1)
+    expect(polls()).toHaveLength(antes)
+  })
+
+  describe('janela segura de atualização (I1a) pelo laço real', () => {
+    it('poll a 30 s pelo sinal com a loja aberta: NÃO é loja fechada', async () => {
+      await ligarSinal() // servidor: next_poll_ms 3000, store_closed false
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(_getUpdateStoreClosedForTests()).toBe(false)
+    })
+
+    it('servidor diz fechada (store_closed + 30 s): libera', async () => {
+      corpoDoPoll = () => ({ jobs: [], next_poll_ms: 30000, store_closed: true })
+      await connect()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(_getUpdateStoreClosedForTests()).toBe(true)
+    })
+
+    it('flag desligada depois (next_poll_ms sem store_closed): volta à regra da 1.4.0, sem false preso', async () => {
+      corpoDoPoll = () => ({ jobs: [], next_poll_ms: 30000, store_closed: false })
+      await connect()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(_getUpdateStoreClosedForTests()).toBe(false)
+      corpoDoPoll = () => ({ jobs: [], next_poll_ms: 30000 })
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(_getUpdateStoreClosedForTests()).toBe(true)
+    })
+
+    it('resposta sem next_poll_ms nem store_closed (entre carimbos): mantém o último', async () => {
+      corpoDoPoll = () => ({ jobs: [], next_poll_ms: 30000, store_closed: false })
+      await connect()
+      await vi.advanceTimersByTimeAsync(0)
+      corpoDoPoll = () => ({ jobs: [] })
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(_getUpdateStoreClosedForTests()).toBe(false)
+    })
+  })
+
+  it('tick antigo preso no handshake não libera o tick novo: continua 1 GET por vez', async () => {
+    setConfig({ session_token: undefined })
+    let liberarAuth: () => void = () => {}
+    let liberarPoll: () => void = () => {}
+    fetchMock.mockImplementation((url: string) =>
+      String(url).endsWith('/api/printer/auth')
+        ? new Promise<Response>((resolve) => {
+            liberarAuth = () =>
+              resolve(
+                responder(200, {
+                  session_token: 'sess-velha',
+                  expires_at: '2099-01-01T00:00:00.000Z',
+                  tenant_id: 'tenant-1',
+                  tenant_name: 'Podrão',
+                  auto_print: true,
+                })
+              )
+          })
+        : new Promise<Response>((resolve) => {
+            liberarPoll = () => resolve(responder(200, { jobs: [], next_poll_ms: 3000 }))
+          })
+    )
+    await connect()
+    await vi.advanceTimersByTimeAsync(0) // T1 preso no /auth
+    await disconnect()
+    setConfig({ session_token: 'sess-boa' })
+    await connect()
+    await vi.advanceTimersByTimeAsync(0) // T2 preso no GET
+    expect(polls()).toHaveLength(1)
+    liberarAuth() // T1 acorda, vê a geração nova e sai
+    await vi.advanceTimersByTimeAsync(0)
+    queueEvents.emit('jobFailureReported', { jobId: 'job-1' })
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(polls()).toHaveLength(1) // nada concorrente com T2
+    liberarPoll()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(polls()).toHaveLength(2) // o pedido pendente vira o próximo tick
   })
 
   it('disconnect: fecha o socket', async () => {

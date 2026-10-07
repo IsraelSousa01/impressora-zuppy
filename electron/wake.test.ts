@@ -441,6 +441,8 @@ describe('WakeController', () => {
       })
     ).not.toThrow()
     expect(controller.state()).toBe('off')
+    // Esquece a versão: o próximo poll pede o conjunto e tenta de novo (nada de "off" silencioso).
+    expect(controller.requestHeader()).toBe('v=;state=off;missed=0')
   })
 
   it('onHealthChange que lança não escapa', () => {
