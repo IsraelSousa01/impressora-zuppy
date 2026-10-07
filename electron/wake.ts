@@ -27,6 +27,8 @@
  *     volta ao ritmo de hoje por 10 min.
  *  5. Duas 200 seguidas sem `wake` ⇒ derruba o socket e esquece a versão (`v=`
  *     vazio até receber um `wake` completo).
+ *  6. Watchdog: fora de `joined` por mais de ~2 min, recria o socket (o
+ *     realtime-js pode parar de reconectar sozinho; ver `recreateIfStuck`).
  */
 
 import { RealtimeClient } from '@supabase/supabase-js'
@@ -73,8 +75,15 @@ export const HEARTBEAT_INTERVAL_MS = 25_000
 export const HEARTBEAT_STALE_MS = 65_000
 /** Teto do jitter dos polls de reconexão (e do reconnect do socket). */
 export const RECONNECT_JITTER_MAX_MS = 5_000
-/** Conferência periódica da saúde (heartbeat parado, fim da penalidade): sem I/O. */
+/** Conferência periódica da saúde (heartbeat parado, fim da penalidade, watchdog): sem I/O. */
 const HEALTH_CHECK_INTERVAL_MS = 5_000
+/**
+ * Watchdog: tempo máximo fora de `joined` antes de recriar o socket. Acima do
+ * maior degrau do reconnect do realtime-js (60 s + jitter), para não brigar com
+ * uma reconexão legítima; mais um jitter de até 30 s.
+ */
+export const WAKE_STUCK_RECREATE_MS = 120_000
+export const WAKE_STUCK_RECREATE_JITTER_MS = 30_000
 /** Backoff do reconnect do socket (a mais o jitter). */
 const SOCKET_RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000]
 
@@ -279,11 +288,17 @@ export interface WakeControllerDeps {
 interface Subscription {
   id: number
   version: string
+  /** O `wake` que abriu este socket: o watchdog o reabre igual. Só em memória. */
+  field: Extract<ParsedWakeField, { kind: 'full' }>
   socket: WakeSocket
   joined: boolean[]
   joinedSinceMs: number | null
   heartbeatOk: boolean
   lastHeartbeatOkAtMs: number
+  /** Desde quando o sinal NÃO está `joined` (`null` = está). Base do watchdog. */
+  notJoinedSinceMs: number | null
+  /** Quanto tempo fora de `joined` o watchdog tolera antes de recriar o socket (com jitter). */
+  stuckLimitMs: number
 }
 
 /** O que realtime.ts passa de cada 200 do poll. */
@@ -471,11 +486,14 @@ export class WakeController {
     const sub: Subscription = {
       id,
       version: field.version,
+      field,
       socket: { close() {} },
       joined: channelNames.map(() => false),
       joinedSinceMs: null,
       heartbeatOk: true,
       lastHeartbeatOkAtMs: now,
+      notJoinedSinceMs: now,
+      stuckLimitMs: WAKE_STUCK_RECREATE_MS + reconnectJitterMs(Math.random, WAKE_STUCK_RECREATE_JITTER_MS),
     }
     this.subscription = sub
     try {
@@ -566,8 +584,45 @@ export class WakeController {
 
   private startHealthTimer(): void {
     if (this.healthTimer) return
-    this.healthTimer = setInterval(() => this.reportHealthIfChanged(), HEALTH_CHECK_INTERVAL_MS)
+    this.healthTimer = setInterval(() => this.healthTick(), HEALTH_CHECK_INTERVAL_MS)
     this.healthTimer.unref?.()
+  }
+
+  private healthTick(): void {
+    try {
+      this.recreateIfStuck()
+    } catch (err) {
+      log.error(`Watchdog do sinal falhou (${errorName(err)})`)
+    } finally {
+      this.reportHealthIfChanged()
+    }
+  }
+
+  /**
+   * Watchdog: o realtime-js (phoenix) pode ficar sem reconectar para sempre.
+   * Medido em 2026-10-07: uma queda no meio do handshake deixa a conexão presa
+   * em CONNECTING, sem `close`, e o `connect()` dele vira no-op. A impressão
+   * não sofre (o poll fica no ritmo de hoje), mas a loja perderia o sinal até
+   * reiniciar o app. Fora de `joined` por mais que `stuckLimitMs`, descarta o
+   * cliente e abre um novo com o mesmo `wake`. Numa queda longa do Realtime,
+   * isso é uma tentativa nova a cada ~2–2,5 min por app (jitter evita a frota em
+   * sincronia).
+   */
+  private recreateIfStuck(now: number = Date.now()): void {
+    const sub = this.subscription
+    if (!sub) return
+    if (this.state(now) === 'joined') {
+      sub.notJoinedSinceMs = null
+      return
+    }
+    if (sub.notJoinedSinceMs === null) {
+      sub.notJoinedSinceMs = now
+      return
+    }
+    const stuckForMs = now - sub.notJoinedSinceMs
+    if (stuckForMs < sub.stuckLimitMs) return
+    log.warn(`Sinal fora do ar há ${Math.round(stuckForMs / 1000)} s; recriando o socket`)
+    this.openSubscription(sub.field)
   }
 
   private stopHealthTimer(): void {

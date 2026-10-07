@@ -44,6 +44,7 @@ const {
   MISSED_SIGNAL_GRACE_MS,
   MISSED_PENALTY_MS,
   HEARTBEAT_STALE_MS,
+  WAKE_STUCK_RECREATE_MS,
 } = await import('./wake')
 type WakeSocketHandlers = import('./wake').WakeSocketHandlers
 type WakeSocketConfig = import('./wake').WakeSocketConfig
@@ -464,6 +465,73 @@ describe('WakeController', () => {
         pollStartedAtMs: Date.now(),
       })
     ).not.toThrow()
+  })
+
+  describe('watchdog: socket preso fora de joined é recriado', () => {
+    beforeEach(() => {
+      vi.spyOn(Math, 'random').mockReturnValue(0) // limite = 120 s, sem jitter
+    })
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    it('nunca entrou (realtime-js preso em CONNECTING): recria depois de ~2 min, com o mesmo wake', () => {
+      const { sockets, responder } = criarControlador()
+      responder(wakeCompleto())
+      vi.advanceTimersByTime(WAKE_STUCK_RECREATE_MS - 5_000)
+      expect(sockets).toHaveLength(1)
+      vi.advanceTimersByTime(10_000)
+      expect(sockets).toHaveLength(2)
+      expect(sockets[0].closed).toBe(true)
+      expect(sockets[1].config).toEqual(sockets[0].config)
+    })
+
+    it('caiu depois de ligado e não voltou: recria; o socket novo entrando volta a ficar saudável', () => {
+      const { controller, sockets, responder } = criarControlador()
+      responder(wakeCompleto())
+      sockets[0].joinAll()
+      vi.advanceTimersByTime(60_000)
+      sockets[0].handlers.onHeartbeat('ok')
+      sockets[0].handlers.onChannelStatus(0, 'CHANNEL_ERROR')
+      vi.advanceTimersByTime(WAKE_STUCK_RECREATE_MS + 10_000)
+      expect(sockets).toHaveLength(2)
+      sockets[1].joinAll()
+      expect(controller.isHealthy()).toBe(true)
+      // Mantém a versão: o servidor segue respondendo só { version }.
+      expect(controller.requestHeader()).toBe('v=v1;state=joined;missed=0')
+    })
+
+    it('ligado e saudável: nunca recria', () => {
+      const { sockets, responder } = criarControlador()
+      responder(wakeCompleto())
+      sockets[0].joinAll()
+      for (let t = 0; t < 10 * 60_000; t += 20_000) {
+        vi.advanceTimersByTime(20_000)
+        sockets[0].handlers.onHeartbeat('ok')
+      }
+      expect(sockets).toHaveLength(1)
+    })
+
+    it('queda curta que o realtime-js resolve sozinho: não recria', () => {
+      const { sockets, responder } = criarControlador()
+      responder(wakeCompleto())
+      sockets[0].joinAll()
+      sockets[0].handlers.onChannelStatus(0, 'CHANNEL_ERROR')
+      vi.advanceTimersByTime(65_000) // maior degrau do reconnect + jitter
+      sockets[0].handlers.onChannelStatus(0, 'SUBSCRIBED')
+      vi.advanceTimersByTime(WAKE_STUCK_RECREATE_MS)
+      expect(sockets).toHaveLength(1)
+    })
+
+    it('queda longa: uma tentativa nova a cada ~2 min, nunca uma rajada', () => {
+      const { sockets, responder } = criarControlador()
+      responder(wakeCompleto())
+      vi.advanceTimersByTime(10 * 60_000)
+      // 600 s / (120 s + até 5 s de cadência do tick) ⇒ 4 ou 5 recriações.
+      expect(sockets.length - 1).toBeGreaterThanOrEqual(4)
+      expect(sockets.length - 1).toBeLessThanOrEqual(5)
+      expect(sockets.slice(0, -1).every((s) => s.closed)).toBe(true)
+    })
   })
 
   describe('sinal perdido', () => {
