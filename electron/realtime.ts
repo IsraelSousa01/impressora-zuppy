@@ -22,17 +22,30 @@
  *   6. Versão do app diferente da que emitiu a sessão guardada ⇒ UM handshake
  *      novo, para o servidor registrar a versão que está mesmo instalada
  *      (ver isSessionFromOtherAppVersion).
+ *   7. Sinal de acordar (1.5.0, ver wake.ts): todo poll manda
+ *      `X-Printer-App-Version` e `X-Printer-Wake`; com o sinal saudável o poll
+ *      de segurança vai a `next_poll_ms_with_wake` (30 s) e cada sinal dispara
+ *      um poll imediato (`wakeNow`, um por vez, com intervalo mínimo). Sem sinal
+ *      saudável, nada muda: ritmo de `next_poll_ms`, como na 1.4.0.
  */
 
 import { EventEmitter } from 'events'
 import { app } from 'electron'
 import { getConfig, setConfig, isConfigured, type AppConfig } from './store'
-import { addToQueue, getQueueStatus } from './print-queue'
-import { maybeInstallOnSafeWindow, isStoreClosedPollInterval } from './updater'
+import { addToQueue, getQueueStatus, queueEvents } from './print-queue'
+import { maybeInstallOnSafeWindow, isStoreClosedForUpdate } from './updater'
 import type { RenderedComanda } from './printer'
 import { createLogger } from './logger'
 import { resolveApiBaseUrl } from './config'
 import { parsePrinterDestination, type PrinterDestination } from './destination'
+import {
+  WakeController,
+  NEXT_POLL_MS_WITH_WAKE,
+  choosePollIntervalMs,
+  reconnectJitterMs,
+  type PollTrigger,
+  type WakeSocketFactory,
+} from './wake'
 
 const log = createLogger('JOBS-POLL')
 
@@ -57,6 +70,19 @@ const MAX_LOGGED_BODY_CHARS = 200
 // confunde o dono. Na prática: 1ª falha segue "connected", 2ª derruba.
 const CONSECUTIVE_FAILURES_BEFORE_DISCONNECTED = 2
 
+// Sinal de acordar. Intervalo mínimo entre o início de um tick e um poll fora
+// do ritmo (sinal, repoll): uma enxurrada de sinais falsos (o canal é público
+// para quem tem o tópico) nunca passa de 1 poll a cada 2 s — abaixo da carga do
+// poll de 3 s de hoje e do limite de 120/min por sessão no servidor.
+export const MIN_OUT_OF_PACE_POLL_GAP_MS = 2000
+/** Poll do sinal voltou vazio (o job pode não estar visível ainda): repoll único depois disto. */
+export const EMPTY_SIGNAL_REPOLL_MS = 2000
+/**
+ * Depois de reportar falha de impressão (PATCH concluído): a nova tentativa no
+ * servidor é `pending → pending` e não emite sinal; com o poll a 30 s ela atrasaria.
+ */
+export const FAILED_JOB_REPOLL_MS = 2000
+
 // ─── Exported event emitter ───────────────────────────────────────────────────
 
 /** Emits 'connected' | 'disconnected' | 'error' for the tray icon and renderer */
@@ -69,8 +95,32 @@ let pollTimeout: ReturnType<typeof setTimeout> | null = null
 let consecutiveFailures = 0
 let isClientActive = false
 let isCurrentlyConnected = false
-/** Último ritmo aceito do servidor (contrato: ausente ⇒ mantém o anterior). */
+/** Último `next_poll_ms` aceito do servidor (contrato: ausente ⇒ mantém o anterior). */
 let currentPollIntervalMs = DEFAULT_POLL_INTERVAL_MS
+/** Último `next_poll_ms_with_wake` aceito (mesmo contrato e mesmo clamp). */
+let pollIntervalWithWakeMs = NEXT_POLL_MS_WITH_WAKE
+/** Último `store_closed` recebido; `null` = o servidor não manda (regra antiga da janela segura). */
+let lastStoreClosed: boolean | null = null
+/**
+ * Geração do tick rodando (do início ao agendamento do próximo); `null` =
+ * nenhum. Amarrada à geração: um tick antigo, preso num `authenticate()` que o
+ * disconnect não aborta, não "libera" o tick novo ao terminar.
+ */
+let inFlightGeneration: number | null = null
+
+function isTickInFlight(): boolean {
+  return inFlightGeneration !== null && inFlightGeneration === pollGeneration
+}
+/** Pedido de poll fora do ritmo que chegou com um tick em voo: vira o próximo tick. */
+let pendingOutOfPace: { trigger: PollTrigger; delayMs: number } | null = null
+/** Quando o timer atual dispara (infinito = nenhum agendado). */
+let pollTimerFireAtMs = Number.POSITIVE_INFINITY
+let lastTickStartedAtMs = Number.NEGATIVE_INFINITY
+
+const wake = new WakeController({
+  onSignal: () => wakeNow(),
+  onHealthChange: (healthy) => handleWakeHealthChange(healthy),
+})
 /**
  * Geração do loop: connect() e disconnect() incrementam; um tick antigo que
  * acorda de um await compara a própria geração e se encerra sem reagendar.
@@ -100,6 +150,7 @@ function clearPollTimer(): void {
     clearTimeout(pollTimeout)
     pollTimeout = null
   }
+  pollTimerFireAtMs = Number.POSITIVE_INFINITY
 }
 
 /**
@@ -319,7 +370,7 @@ async function reauthenticateToReportAppVersion(): Promise<void> {
 // ─── Poll de jobs pendentes ───────────────────────────────────────────────────
 
 type PollResult =
-  | { status: 'ok' }
+  | { status: 'ok'; jobCount: number }
   | { status: 'unauthorized' }
   | { status: 'rate_limited'; retryAfterMs: number | null }
   | { status: 'server_error'; httpStatus: number }
@@ -340,13 +391,19 @@ type PollResult =
 async function fetchAndEnqueuePendingJobs(
   apiBaseUrl: string,
   sessionToken: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  trigger: PollTrigger,
+  pollStartedAtMs: number
 ): Promise<PollResult> {
   const url = `${apiBaseUrl}/api/printer/jobs`
   const res = await fetch(url, {
     method: 'GET',
     headers: {
       Authorization: `Bearer ${sessionToken}`,
+      // Sinal de acordar (aditivos: servidor sem a feature ignora). A versão é
+      // a mesma que o handshake e o /status local reportam.
+      'X-Printer-App-Version': app.getVersion(),
+      'X-Printer-Wake': wake.requestHeader(),
     },
     signal,
   })
@@ -368,14 +425,22 @@ async function fetchAndEnqueuePendingJobs(
       order: any
       render?: RenderedComanda[]
       resolved_columns?: number
+      /** Sinal de acordar: o servidor esperava um sinal por este job. */
+      wake_expected?: unknown
     }>
     /** Ritmo pedido pelo servidor; só vem quando ele recalcula (máx. 1×/min) */
     next_poll_ms?: number
+    // Aditivos do sinal de acordar (só com o header e a loja na flag).
+    next_poll_ms_with_wake?: unknown
+    store_closed?: unknown
+    wake?: unknown
+    wake_missed_recorded?: unknown
   }
 
-  if (data.jobs && data.jobs.length > 0) {
-    log.info(`Poll: found ${data.jobs.length} pending print jobs`)
-    for (const job of data.jobs) {
+  const jobs = Array.isArray(data.jobs) ? data.jobs : []
+  if (jobs.length > 0) {
+    log.info(`Poll: found ${jobs.length} pending print jobs`)
+    for (const job of jobs) {
       addToQueue(job.id, job.order_id, job.order, job.render, job.resolved_columns)
     }
   }
@@ -383,23 +448,143 @@ async function fetchAndEnqueuePendingJobs(
   // Contrato: `next_poll_ms` só é considerado em resposta 200 — por isso a
   // leitura vive aqui, depois de todos os early-returns de status.
   currentPollIntervalMs = resolveNextPollIntervalMs(data.next_poll_ms, currentPollIntervalMs)
+  pollIntervalWithWakeMs = resolveNextPollIntervalMs(data.next_poll_ms_with_wake, pollIntervalWithWakeMs)
+  // `store_closed` viaja na mesma cadência do `next_poll_ms`: ausente numa
+  // resposta SEM `next_poll_ms` ⇒ mantém o último; ausente numa resposta COM
+  // `next_poll_ms` ⇒ o servidor deixou de mandá-lo (flag desligada) e a janela
+  // segura volta à regra da 1.4.0 — um `false` velho travaria a atualização
+  // para sempre num app que roda 24/7.
+  if (typeof data.store_closed === 'boolean') lastStoreClosed = data.store_closed
+  else if (typeof data.next_poll_ms === 'number') lastStoreClosed = null
 
-  return { status: 'ok' }
+  // Depois de enfileirar: nada do sinal pode custar uma comanda (handlePollResponse nunca lança).
+  wake.handlePollResponse({
+    wake: data.wake,
+    jobs,
+    wakeMissedRecorded: data.wake_missed_recorded,
+    trigger,
+    pollStartedAtMs,
+  })
+
+  return { status: 'ok', jobCount: jobs.length }
 }
 
 // ─── Polling loop ─────────────────────────────────────────────────────────────
 
-function scheduleNextPoll(generation: number, delayMs: number): void {
+/** Gatilho do tick agendado; mutável porque um sinal pode "adotar" um tick já agendado. */
+let pollTimerTrigger: PollTrigger = 'safety'
+
+function scheduleNextPoll(generation: number, delayMs: number, trigger: PollTrigger = 'safety'): void {
   if (!isClientActive || generation !== pollGeneration) return
   clearPollTimer()
+  pollTimerFireAtMs = Date.now() + delayMs
+  pollTimerTrigger = trigger
   pollTimeout = setTimeout(() => {
-    pollTick(generation).catch((err) => {
+    pollTimeout = null
+    pollTimerFireAtMs = Number.POSITIVE_INFINITY
+    pollTick(generation, pollTimerTrigger).catch((err) => {
       // pollTick trata os próprios erros; isto é a última linha de defesa pra
       // uma rejeição inesperada não matar a cadeia de polling.
       log.error('pollTick promise rejection:', err instanceof Error ? err.message : String(err))
       handlePollFailure(generation, null)
     })
   }, delayMs)
+}
+
+/** Ritmo do próximo poll de segurança: o do sinal só com o sinal saudável. */
+function safetyPollIntervalMs(): number {
+  let healthy = false
+  try {
+    healthy = wake.isHealthy()
+  } catch {
+    healthy = false
+  }
+  return choosePollIntervalMs({
+    healthy,
+    serverPollMs: currentPollIntervalMs,
+    withWakeMs: pollIntervalWithWakeMs,
+  })
+}
+
+/**
+ * Pede um poll fora do ritmo (sinal, repoll). Garantias:
+ *  - um ciclo por vez: com um tick em voo, vira "repoll pendente" e roda
+ *    quando ele terminar;
+ *  - intervalo mínimo `MIN_OUT_OF_PACE_POLL_GAP_MS` desde o início do último tick;
+ *  - nunca fura backoff de erro nem `Retry-After` de 429 (com falha em curso, ignora);
+ *  - com um tick já agendado para antes, não cria outro (sinais simultâneos = 1 GET).
+ */
+function requestPoll(trigger: PollTrigger, delayMs: number): void {
+  if (!isClientActive || consecutiveFailures > 0) return
+  if (isTickInFlight()) {
+    if (!pendingOutOfPace || trigger === 'signal') pendingOutOfPace = { trigger, delayMs }
+    return
+  }
+  const now = Date.now()
+  const fireAt = Math.max(now + delayMs, lastTickStartedAtMs + MIN_OUT_OF_PACE_POLL_GAP_MS)
+  if (pollTimerFireAtMs <= fireAt) {
+    // O tick já agendado cobre o pedido. Um sinal o marca como tal: ele deixa
+    // de ser poll de segurança (não conta sinal perdido; vazio, ganha repoll).
+    if (trigger === 'signal') pollTimerTrigger = 'signal'
+    return
+  }
+  scheduleNextPoll(pollGeneration, fireAt - now, trigger)
+}
+
+/** Chegou um sinal de acordar: um poll agora (com as garantias de `requestPoll`). */
+export function wakeNow(): void {
+  try {
+    requestPoll('signal', 0)
+  } catch (err) {
+    log.error('wakeNow falhou (ignorado):', err instanceof Error ? err.message : String(err))
+  }
+}
+
+/**
+ * O sinal deixou de ser saudável (socket caiu, heartbeat parou, sinal
+ * perdido): o poll de segurança agendado pode estar a até 30 s. Volta ao ritmo
+ * de hoje JÁ, com jitter de 0 a 5 s — uma queda do Realtime atinge a frota
+ * inteira ao mesmo tempo e não pode virar uma rajada sincronizada.
+ */
+function handleWakeHealthChange(healthy: boolean): void {
+  try {
+    if (healthy || !isClientActive || isTickInFlight() || consecutiveFailures > 0) return
+    const delay = reconnectJitterMs()
+    if (pollTimerFireAtMs <= Date.now() + delay) return
+    scheduleNextPoll(pollGeneration, delay, 'catchup')
+  } catch (err) {
+    log.error('Reagendar após queda do sinal falhou (ignorado):', err instanceof Error ? err.message : String(err))
+  }
+}
+
+// Contrato do sinal: depois de reportar falha de impressão, repoll curto. O
+// evento sai quando o PATCH de confirmação termina, para o repoll não chegar
+// antes de o servidor devolver o job a `pending` (rede lenta da loja).
+queueEvents.on('jobFailureReported', () => {
+  try {
+    requestPoll('repoll', FAILED_JOB_REPOLL_MS)
+  } catch (err) {
+    log.error('Repoll após falha falhou (ignorado):', err instanceof Error ? err.message : String(err))
+  }
+})
+
+/**
+ * Próximo tick depois de uma 200: o pedido fora do ritmo que chegou durante o
+ * tick; ou o repoll único de um poll de sinal vazio; ou o poll de segurança.
+ */
+function scheduleAfterOkPoll(generation: number, trigger: PollTrigger, jobCount: number): void {
+  const pending = pendingOutOfPace
+  pendingOutOfPace = null
+  if (pending) {
+    const gapLeftMs = lastTickStartedAtMs + MIN_OUT_OF_PACE_POLL_GAP_MS - Date.now()
+    scheduleNextPoll(generation, Math.max(pending.delayMs, gapLeftMs, 0), pending.trigger)
+    return
+  }
+  if (trigger === 'signal' && jobCount === 0) {
+    scheduleNextPoll(generation, EMPTY_SIGNAL_REPOLL_MS, 'repoll')
+    return
+  }
+  scheduleNextPoll(generation, safetyPollIntervalMs(), 'safety')
 }
 
 /**
@@ -411,7 +596,9 @@ function scheduleNextPoll(generation: number, delayMs: number): void {
 function reportUpdateSafeWindowSignals(): void {
   try {
     maybeInstallOnSafeWindow({
-      storeClosed: isStoreClosedPollInterval(currentPollIntervalMs),
+      // O `next_poll_ms` do SERVIDOR, nunca o ritmo escolhido pelo app: com o
+      // sinal saudável o app polla a 30 s com a loja aberta.
+      storeClosed: isStoreClosedForUpdate(lastStoreClosed, currentPollIntervalMs),
       queueEmpty: getQueueStatus().length === 0,
     })
   } catch (err) {
@@ -439,8 +626,20 @@ function handlePollFailure(generation: number, delayOverrideMs: number | null): 
  * pendentes e agenda o próximo tick. Ao voltar ao normal depois de falhas,
  * zera o backoff e retoma o ritmo ditado pelo servidor.
  */
-async function pollTick(generation: number): Promise<void> {
+async function pollTick(generation: number, trigger: PollTrigger): Promise<void> {
   if (!isClientActive || generation !== pollGeneration) return
+  inFlightGeneration = generation
+  try {
+    await runPollTick(generation, trigger)
+  } finally {
+    if (inFlightGeneration === generation) inFlightGeneration = null
+  }
+}
+
+async function runPollTick(generation: number, trigger: PollTrigger): Promise<void> {
+  lastTickStartedAtMs = Date.now()
+  // Um pedido anterior a este tick é atendido por ele.
+  pendingOutOfPace = null
 
   let cfg = getConfig()
 
@@ -477,7 +676,9 @@ async function pollTick(generation: number): Promise<void> {
     result = await fetchAndEnqueuePendingJobs(
       resolveApiBaseUrl(cfg),
       cfg.session_token!,
-      controller.signal
+      controller.signal,
+      trigger,
+      lastTickStartedAtMs
     )
   } catch (err) {
     // abort() proposital (disconnect/reconfigure) não é erro real
@@ -497,7 +698,7 @@ async function pollTick(generation: number): Promise<void> {
         isCurrentlyConnected = true
         realtimeEvents.emit('connected')
       }
-      scheduleNextPoll(generation, currentPollIntervalMs)
+      scheduleAfterOkPoll(generation, trigger, result.jobCount)
       // Depois de já ter agendado o próximo tick: nada aqui afeta o loop.
       reportUpdateSafeWindowSignals()
       return
@@ -505,6 +706,8 @@ async function pollTick(generation: number): Promise<void> {
       // Sessão expirada/revogada: zera e re-autentica no próximo tick.
       log.warn('Jobs poll unauthorized (401). Invalidating session and re-authenticating…')
       setConfig({ session_token: undefined })
+      // Os tópicos eram da sessão revogada: a próxima 200 entrega os da nova.
+      wake.reset('sessão inválida (401)')
       handlePollFailure(generation, null)
       return
     case 'rate_limited':
@@ -515,6 +718,7 @@ async function pollTick(generation: number): Promise<void> {
       return
     case 'server_error':
       log.error(`Jobs poll returned status code ${result.httpStatus}`)
+      if (result.httpStatus === 403) wake.reset('assinatura encerrada (403)')
       handlePollFailure(generation, null)
       return
     case 'network_error':
@@ -540,6 +744,10 @@ export async function connect(): Promise<void> {
   log.info('Starting print jobs polling client…')
   consecutiveFailures = 0
   appVersionHandshakeAttempted = false
+  pendingOutOfPace = null
+  lastTickStartedAtMs = Number.NEGATIVE_INFINITY
+  // A janela segura da conexão anterior (outra loja, outro pareamento) não vale.
+  lastStoreClosed = null
   clearPollTimer()
   const generation = ++pollGeneration
 
@@ -566,11 +774,27 @@ export async function disconnect(): Promise<void> {
     activeController.abort()
     activeController = null
   }
+  pendingOutOfPace = null
+  wake.reset('polling parado')
 
   if (isCurrentlyConnected) {
     isCurrentlyConnected = false
     realtimeEvents.emit('disconnected')
   }
+}
+
+/** Só para testes: socket do sinal falso e leitura do estado dele. */
+export function _setWakeSocketFactoryForTests(factory: WakeSocketFactory): void {
+  wake.setSocketFactoryForTests(factory)
+}
+
+export function _getWakeForTests(): WakeController {
+  return wake
+}
+
+/** O "loja fechada" que a próxima 200 entregaria à janela segura de atualização. */
+export function _getUpdateStoreClosedForTests(): boolean {
+  return isStoreClosedForUpdate(lastStoreClosed, currentPollIntervalMs)
 }
 
 /**

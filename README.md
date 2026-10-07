@@ -60,6 +60,7 @@ impressora-zuppy/
 │   ├── preload.ts       # Bridge renderer ↔ main (contextBridge)
 │   ├── http-server.ts   # Express em localhost:7847
 │   ├── realtime.ts      # Polling de print jobs na API do Zuppy
+│   ├── wake.ts          # Sinal de acordar (Supabase Realtime) que deixa o poll a 30 s
 │   ├── print-queue.ts   # Fila de impressão com retry
 │   ├── printer.ts       # ESC/POS via node-thermal-printer
 │   ├── windows-printer-list.ts # Lista as impressoras do Windows (PowerShell, sem wmic)
@@ -240,6 +241,21 @@ Use https://www.icoconverter.com/ para converter PNG → ICO.
 ## Auto-atualização
 
 Configure `electron-builder.yml` com seu repositório GitHub e crie releases normalmente. O app verifica atualizações a cada 4 horas.
+
+O update baixado só é instalado sozinho na "janela segura": loja fechada por horário, fila de impressão vazia e quieta há 60 s. "Loja fechada" vem do `next_poll_ms` do servidor (30 s = fechada) e, desde a 1.5.0, também do `store_closed` quando o servidor o manda (os dois precisam concordar). O ritmo que o próprio app escolhe com o sinal de acordar (30 s) nunca conta.
+
+Lançamento gradual: o `latest.yml` aceita `stagingPercentage: <0-100>`; cada instalação sorteia um número fixo e só atualiza se ele cair dentro do percentual. Para ampliar, edite o `latest.yml` da release (subir o percentual) ou remova a linha. Publique o `latest.yml` **por último**, depois do `.exe` e do `.blockmap`.
+
+## Sinal de acordar (1.5.0)
+
+O poll de `GET /api/printer/jobs` passou a ser rede de segurança. Quando o servidor oferece o campo `wake` (flag `PRINTER_WAKE_SIGNAL_*` do Zuppy ligada para a loja), o app abre um WebSocket no Supabase Realtime (`electron/wake.ts`) e assina o canal `printer-wake:<tópico>` de cada loja que imprime. Qualquer mensagem no canal dispara um poll imediato; com o canal saudável o poll de segurança cai de 3 s para 30 s.
+
+- **Nenhuma loja depende do sinal.** Sem `wake`, com o canal fora, heartbeat parado ou um sinal perdido detectado, o app volta ao ritmo de hoje (`next_poll_ms`), com jitter de 0 a 5 s no primeiro poll depois da queda.
+- **Um poll por vez.** Sinais simultâneos geram 1 GET; entre polls fora do ritmo há no mínimo 2 s; sinal nunca fura backoff de erro nem `Retry-After`.
+- **Poll do sinal vazio** ganha um repoll único em 2 s; falha de impressão reportada também (a nova tentativa no servidor não emite sinal).
+- **Sinal perdido**: comanda com `wake_expected` achada pelo poll de segurança, sem sinal nos 15 s anteriores nem nos 5 s seguintes, com o canal ligado há mais de 60 s. Volta ao ritmo de hoje por 10 min e reporta em `missed`.
+- **Headers de todo poll**: `X-Printer-App-Version: <versão>` e `X-Printer-Wake: v=<versão dos tópicos>;state=joined|degraded|off;missed=<n>`.
+- **Segredos**: a URL só é aceita como `https://<ref>.supabase.co`; tópico, anon key e URL do socket nunca vão a log nem ao `/status`.
 
 ## Segurança
 
