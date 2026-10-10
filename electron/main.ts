@@ -30,7 +30,7 @@ import { showOpenNotice } from './open-notice'
 import { PROTOCOL_SCHEME, parseLaunchRequest, shouldShowNoticeOnBoot } from './launch'
 import { markStarted, markCleanExit, allowCrashRelaunch } from './run-state'
 import { formatDeviceLabel } from './destination'
-import { createLogger } from './logger'
+import { createLogger, initFileLog } from './logger'
 import {
   resolveInstanceIdentity,
   resolvePortCandidates,
@@ -51,9 +51,6 @@ const IS_DEV = !app.isPackaged
  */
 const instance = resolveInstanceIdentity(process.argv, process.env)
 
-for (const warning of instance.warnings) {
-  log.warn(warning)
-}
 
 /**
  * Pasta de dados própria por profile. Tem que acontecer AQUI, antes do
@@ -71,7 +68,6 @@ if (instance.profile !== null) {
   const userDataPath = resolveUserDataPath(app.getPath('userData'), instance.profile)
   fs.mkdirSync(userDataPath, { recursive: true })
   app.setPath('userData', userDataPath)
-  log.info(`Instância "${instance.profile}" — dados em ${userDataPath}`)
 }
 
 // ─── Single instance lock ─────────────────────────────────────────────────────
@@ -80,6 +76,27 @@ const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   log.warn('Another instance is already running – quitting')
   app.quit()
+} else {
+  /**
+   * Registro em arquivo (o console do app instalado se perde). Só quem ganhou o
+   * lock abre o arquivo: a segunda cópia podaria/rotacionaria o arquivo em uso
+   * pela primeira. Nome por profile: duas instâncias na mesma máquina não
+   * escrevem no mesmo arquivo. Falhar aqui nunca impede o app de subir.
+   */
+  try {
+    const logFileName =
+      instance.profile === null ? 'zuppy-impressora' : `zuppy-impressora-${instance.profile}`
+    initFileLog(app.getPath('logs'), logFileName)
+  } catch (err) {
+    console.error('Registro em arquivo indisponível:', err instanceof Error ? err.message : String(err))
+  }
+
+  for (const warning of instance.warnings) {
+    log.warn(warning)
+  }
+  if (instance.profile !== null) {
+    log.info(`Instância "${instance.profile}" — dados em ${app.getPath('userData')}`)
+  }
 }
 
 // ─── IPC handlers ─────────────────────────────────────────────────────────────

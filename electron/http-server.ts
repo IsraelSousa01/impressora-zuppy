@@ -12,6 +12,7 @@
  *   POST /test-print      → print a test page
  *   POST /print-raw       → print a ready-made ESC/POS document (base64)
  *   POST /install-update  → install a downloaded update on demand (panel button)
+ *   GET  /logs            → trecho recente do registro em arquivo (só o diagnóstico do Zuppy)
  *
  * Security:
  *   - Binds to 127.0.0.1 only (never 0.0.0.0)
@@ -37,7 +38,7 @@ import {
   testPrint,
   printRawDocument,
 } from './printer'
-import { createLogger, maskDeviceToken } from './logger'
+import { createLogger, maskDeviceToken, readRecentLog } from './logger'
 import { formatDeviceLabel } from './destination'
 import { DEFAULT_LOCAL_PORT } from './instance'
 
@@ -189,6 +190,40 @@ export function validatePrintRawDocument(bytesBase64: unknown): PrintRawValidati
   }
 
   return { ok: true, bytes }
+}
+
+// ─── /logs ────────────────────────────────────────────────────────────────────
+
+/** Teto de linhas por resposta do /logs (e o padrão quando `lines` não vem). */
+export const LOGS_MAX_LINES = 500
+
+/**
+ * Quem pode ler o registro: SÓ uma página do Zuppy (ou o Gestor em `npm run
+ * dev`), identificada pelo header `Origin`, que o navegador preenche e uma
+ * página não consegue falsificar.
+ *
+ * Mais rígido que o resto do servidor de propósito: aqui a ausência de `Origin`
+ * NEGA. `/status` e `/printers` deixam passar quem não manda Origin (Postman,
+ * mesmo processo); o registro, mesmo filtrado, não tem por que ser lido por
+ * qualquer programa da máquina nem por um DNS rebinding que perdeu o Host. O
+ * endereço local só vale fora de build empacotado (mesma regra do `api_url`).
+ */
+export function isLogReadAllowed(
+  originHeader: string | undefined,
+  opts: { allowLocalOrigin: boolean }
+): boolean {
+  if (!originHeader) return false
+  const origin = canonicalizeZuppyApiOrigin(normalizeOrigin(originHeader))
+  if (!isAllowedZuppyOrigin(origin)) return false
+  if (!opts.allowLocalOrigin && isLocalApiOrigin(origin)) return false
+  return true
+}
+
+/** `?lines=` do /logs: inteiro positivo, no máximo `LOGS_MAX_LINES`; lixo vira o padrão. */
+export function parseLogsLines(raw: unknown): number {
+  const n = typeof raw === 'string' ? Number(raw) : NaN
+  if (!Number.isInteger(n) || n < 1) return LOGS_MAX_LINES
+  return Math.min(n, LOGS_MAX_LINES)
 }
 
 // ─── /configure ───────────────────────────────────────────────────────────────
@@ -407,6 +442,26 @@ function buildRouter(port: number) {
       // `downloadedAt` deixa o painel detectar "esperando há muito tempo" e
       // oferecer o botão de instalar agora (POST /install-update).
       update: getUpdateState(),
+    })
+  })
+
+  /**
+   * GET /logs — trecho recente (≤ 24 h, ≤ 500 linhas) do registro em arquivo,
+   * para o diagnóstico do Zuppy ler. Sem upload automático: só responde a quem
+   * pede, e só a uma página do Zuppy (ver isLogReadAllowed).
+   */
+  router.get('/logs', (req: Request, res: Response) => {
+    if (!isLogReadAllowed(req.get('origin'), { allowLocalOrigin: !electronApp.isPackaged })) {
+      res.status(403).json({ error: 'origin not allowed' })
+      return
+    }
+
+    const { lines, truncated } = readRecentLog(parseLogsLines(req.query.lines))
+    res.json({
+      [PRINTER_APP_IDENTITY_FIELD]: PRINTER_APP_IDENTITY_VERSION,
+      window_hours: 24,
+      truncated,
+      lines,
     })
   })
 
