@@ -13,14 +13,15 @@
  *  8. Atalho `zuppy-impressora://abrir` e janelinha "está aberto"
  */
 
-import { app, ipcMain } from 'electron'
+import { app, ipcMain, powerSaveBlocker } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import fs from 'fs'
 
 import { getConfig, isConfigured, getLogs, setConfig } from './store'
 import { loadPendingQueue } from './store'
 import { startHttpServer, stopHttpServer, getBoundPort } from './http-server'
-import { connect, disconnect } from './realtime'
+import { connect, disconnect, realtimeEvents } from './realtime'
+import { createSleepGuard } from './sleep-guard'
 import { restoreQueue, getQueueStatus } from './print-queue'
 import { registerDownloadedUpdate } from './updater'
 import { enumeratePrinters, listPrinters, testPrint } from './printer'
@@ -214,6 +215,34 @@ function configureAutoStart(): void {
   log.info(`Auto-start configured (${settings.name})`)
 }
 
+// ─── Computador acordado com a loja aberta ────────────────────────────────────
+
+/**
+ * `prevent-app-suspension`: o sistema não suspende, a tela apaga normalmente.
+ * Ligado/desligado pelo sinal de cada consulta bem-sucedida (ver
+ * electron/sleep-guard.ts e o evento `poll-ok` de electron/realtime.ts).
+ */
+const sleepGuard = createSleepGuard({
+  start: () => powerSaveBlocker.start('prevent-app-suspension'),
+  stop: (id) => powerSaveBlocker.stop(id),
+})
+
+function setupSleepGuard(): void {
+  realtimeEvents.on('poll-ok', (signals: { storeClosed: boolean; hasSession: boolean }) => {
+    const wasActive = sleepGuard.isActive()
+    sleepGuard.update(signals)
+    if (wasActive !== sleepGuard.isActive()) {
+      log.info(
+        sleepGuard.isActive()
+          ? 'Loja aberta: computador mantido acordado'
+          : 'Loja fechada: computador liberado para dormir',
+      )
+    }
+  })
+  // Pareamento trocado / app parado: nada de segurar o computador sem sessão.
+  realtimeEvents.on('disconnected', () => sleepGuard.release())
+}
+
 // ─── Atalho que o navegador chama ──────────────────────────────────────────────
 
 /**
@@ -287,6 +316,7 @@ process.on('unhandledRejection', (reason) => {
 app.on('before-quit', async () => {
   log.info('App quitting…')
   markCleanExit(app.getPath('userData'))
+  sleepGuard.release()
   destroyTray()
   await stopHttpServer()
   await disconnect()
@@ -339,6 +369,9 @@ app.whenReady().then(async () => {
 
   // Auto-start registration
   configureAutoStart()
+
+  // Computador acordado com a loja aberta
+  setupSleepGuard()
 
   // Atalho do navegador
   registerProtocolClient()

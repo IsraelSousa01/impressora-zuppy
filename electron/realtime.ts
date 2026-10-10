@@ -86,7 +86,10 @@ export const FAILED_JOB_REPOLL_MS = 2000
 
 // ─── Exported event emitter ───────────────────────────────────────────────────
 
-/** Emits 'connected' | 'disconnected' | 'error' for the tray icon and renderer */
+/**
+ * Emits 'connected' | 'disconnected' | 'error' for the tray icon and renderer,
+ * e 'poll-ok' ({ storeClosed, hasSession }) a cada consulta bem-sucedida.
+ */
 export const realtimeEvents = new EventEmitter()
 
 // ─── State ────────────────────────────────────────────────────────────────────
@@ -671,10 +674,18 @@ function scheduleAfterOkPoll(generation: number, trigger: PollTrigger, jobCount:
  */
 function reportUpdateSafeWindowSignals(): void {
   try {
+    // O `next_poll_ms` do SERVIDOR, nunca o ritmo escolhido pelo app: com o
+    // sinal saudável o app polla a 30 s com a loja aberta.
+    const storeClosed = isStoreClosedForUpdate(lastStoreClosed, currentPollIntervalMs)
+    // Quem segura o sono do computador (electron/sleep-guard.ts) ouve isto.
+    // A conjunção de isStoreClosedForUpdate nunca declara "fechada" a mais que
+    // o servidor: na dúvida o computador fica acordado.
+    realtimeEvents.emit('poll-ok', {
+      storeClosed,
+      hasSession: Boolean(getConfig().session_token),
+    })
     maybeInstallOnSafeWindow({
-      // O `next_poll_ms` do SERVIDOR, nunca o ritmo escolhido pelo app: com o
-      // sinal saudável o app polla a 30 s com a loja aberta.
-      storeClosed: isStoreClosedForUpdate(lastStoreClosed, currentPollIntervalMs),
+      storeClosed,
       queueEmpty: getQueueStatus().length === 0,
     })
   } catch (err) {

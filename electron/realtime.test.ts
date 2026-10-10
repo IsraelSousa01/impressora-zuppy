@@ -62,6 +62,7 @@ const {
   disconnect,
   _setWakeSocketFactoryForTests,
   _getUpdateStoreClosedForTests,
+  realtimeEvents,
   PAPER_HANDSHAKE_RETRY_MS,
 } = await import('./realtime')
 const { getConfig, setConfig } = await import('./store')
@@ -667,6 +668,37 @@ describe('polling com o sinal de acordar (1.5.0)', () => {
       corpoDoPoll = () => ({ jobs: [] })
       await vi.advanceTimersByTimeAsync(30_000)
       expect(_getUpdateStoreClosedForTests()).toBe(false)
+    })
+  })
+
+  describe("evento 'poll-ok' (segura o sono do computador com a loja aberta)", () => {
+    function ouvirPollOk() {
+      const recebidos: Array<{ storeClosed: boolean; hasSession: boolean }> = []
+      const ouvinte = (s: { storeClosed: boolean; hasSession: boolean }) => recebidos.push(s)
+      realtimeEvents.on('poll-ok', ouvinte)
+      return { recebidos, parar: () => realtimeEvents.off('poll-ok', ouvinte) }
+    }
+
+    it('cada consulta 200 diz se a loja está fechada e se há sessão', async () => {
+      const o = ouvirPollOk()
+      corpoDoPoll = () => ({ jobs: [], next_poll_ms: 30000, store_closed: false })
+      await connect()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(o.recebidos.at(-1)).toEqual({ storeClosed: false, hasSession: true })
+
+      corpoDoPoll = () => ({ jobs: [], next_poll_ms: 30000, store_closed: true })
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(o.recebidos.at(-1)).toEqual({ storeClosed: true, hasSession: true })
+      o.parar()
+    })
+
+    it('consulta que falha (500) não emite: sem sinal novo o bloqueio expira sozinho', async () => {
+      const o = ouvirPollOk()
+      statusDoPoll = 500
+      await connect()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(o.recebidos).toHaveLength(0)
+      o.parar()
     })
   })
 
