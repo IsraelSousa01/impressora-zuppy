@@ -10,6 +10,7 @@
  *  5. Polling de print jobs na API do Zuppy
  *  6. Print queue crash-recovery
  *  7. Auto-updater
+ *  8. Atalho `zuppy-impressora://abrir` e janelinha "está aberto"
  */
 
 import { app, ipcMain } from 'electron'
@@ -24,6 +25,8 @@ import { restoreQueue, getQueueStatus } from './print-queue'
 import { registerDownloadedUpdate } from './updater'
 import { enumeratePrinters, listPrinters, testPrint } from './printer'
 import { createTray, updateTray, destroyTray } from './tray'
+import { showOpenNotice } from './open-notice'
+import { PROTOCOL_SCHEME, parseLaunchRequest, shouldShowNoticeOnBoot } from './launch'
 import { formatDeviceLabel } from './destination'
 import { createLogger } from './logger'
 import {
@@ -210,10 +213,37 @@ function configureAutoStart(): void {
   log.info(`Auto-start configured (${settings.name})`)
 }
 
+// ─── Atalho que o navegador chama ──────────────────────────────────────────────
+
+/**
+ * Registra `zuppy-impressora://abrir` no Windows. Só no app empacotado (em dev
+ * registraria o electron.exe) e só na instância default: o registro é um só por
+ * máquina e as instâncias com profile não podem disputá-lo. Falhar aqui não
+ * pode impedir o app de imprimir.
+ */
+function registerProtocolClient(): void {
+  if (IS_DEV || instance.profile !== null) return
+  try {
+    const ok = app.setAsDefaultProtocolClient(PROTOCOL_SCHEME)
+    log.info(`Atalho ${PROTOCOL_SCHEME}://abrir ${ok ? 'registrado' : 'não registrado'}`)
+  } catch (err) {
+    log.error('Registrar o atalho do navegador falhou', err)
+  }
+}
+
 // ─── App lifecycle ────────────────────────────────────────────────────────────
 
-app.on('second-instance', () => {
+// Segunda abertura (clique no atalho, ou o navegador chamando
+// `zuppy-impressora://abrir`) com o app já rodando: mostra a janelinha em vez de
+// calar. O argv vem do navegador e é validado em parseLaunchRequest.
+app.on('second-instance', (_event, argv) => {
+  const request = parseLaunchRequest(argv)
+  if (request.kind === 'ignore') {
+    log.warn('Segunda abertura com link não reconhecido — ignorada')
+    return
+  }
   log.info('Second instance detected - app is already running in tray')
+  showOpenNotice()
 })
 
 app.on('window-all-closed', () => {
@@ -267,4 +297,9 @@ app.whenReady().then(async () => {
 
   // Auto-start registration
   configureAutoStart()
+
+  // Atalho do navegador
+  registerProtocolClient()
+  // Aberto PELO link (app ainda fechado): o lojista espera uma resposta.
+  if (gotLock && shouldShowNoticeOnBoot(process.argv)) showOpenNotice()
 })
