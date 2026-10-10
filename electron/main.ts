@@ -27,6 +27,7 @@ import { enumeratePrinters, listPrinters, testPrint } from './printer'
 import { createTray, updateTray, destroyTray } from './tray'
 import { showOpenNotice } from './open-notice'
 import { PROTOCOL_SCHEME, parseLaunchRequest, shouldShowNoticeOnBoot } from './launch'
+import { markStarted, markCleanExit, allowCrashRelaunch } from './run-state'
 import { formatDeviceLabel } from './destination'
 import { createLogger } from './logger'
 import {
@@ -251,8 +252,41 @@ app.on('window-all-closed', () => {
   // presença deste listener (sem chamar app.quit()) impede o encerramento.
 })
 
+/**
+ * Erro inesperado no processo principal. Sem handler o Electron abre uma caixa
+ * "A JavaScript error occurred in the main process" e o app headless fica
+ * parado atrás dela, sem imprimir. Aqui: registra (só a mensagem, nunca o
+ * objeto) e reabre limpo, com teto de reaberturas (allowCrashRelaunch) para um
+ * erro de boot não virar laço. Acima do teto o app SEGUE VIVO: sair deixaria a
+ * loja sem impressão e sem ninguém para reabrir. Queda dura (kill, falta de
+ * energia) nenhum código do processo trata: aí vale o auto-start do Windows.
+ */
+function handleUncaughtException(err: unknown): void {
+  log.error('Erro inesperado:', err instanceof Error ? err.message : String(err))
+  if (IS_DEV) return
+
+  const userData = app.getPath('userData')
+  if (!allowCrashRelaunch(userData)) {
+    log.error('Reaberturas demais em pouco tempo; sigo rodando sem reabrir')
+    return
+  }
+
+  markCleanExit(userData)
+  // O link do navegador não é argumento a repetir na reabertura.
+  const args = process.argv.slice(1).filter((a) => !a.toLowerCase().startsWith(`${PROTOCOL_SCHEME}:`))
+  app.relaunch({ args })
+  app.exit(1)
+}
+
+process.on('uncaughtException', handleUncaughtException)
+// Promessa rejeitada solta: o estado do processo segue são, só registra.
+process.on('unhandledRejection', (reason) => {
+  log.error('Promessa rejeitada sem tratamento:', reason instanceof Error ? reason.message : String(reason))
+})
+
 app.on('before-quit', async () => {
   log.info('App quitting…')
+  markCleanExit(app.getPath('userData'))
   destroyTray()
   await stopHttpServer()
   await disconnect()
@@ -260,6 +294,14 @@ app.on('before-quit', async () => {
 
 app.whenReady().then(async () => {
   log.info(`Zuppy Impressora v${app.getVersion()} starting (Headless Mode)`)
+
+  const previousRun = markStarted(app.getPath('userData'))
+  if (previousRun.previousEndedUnexpectedly) {
+    log.warn(
+      'A execução anterior não terminou normalmente ' +
+        `(iniciada em ${previousRun.previousStartedAt ? new Date(previousRun.previousStartedAt).toISOString() : 'horário desconhecido'})`,
+    )
+  }
 
   // Register IPC handlers
   registerIpcHandlers()

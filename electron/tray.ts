@@ -10,7 +10,9 @@
 
 import { Tray, Menu, nativeImage, app, dialog } from 'electron'
 import path from 'path'
-import { getConfig } from './store'
+import { getConfig, isConfigured } from './store'
+import { getQueueStatus } from './print-queue'
+import { buildQuitConfirmation } from './quit-guard'
 import { formatDeviceLabel } from './destination'
 import { pairFromClipboard } from './pairing'
 import { createLogger } from './logger'
@@ -77,6 +79,37 @@ async function pairFromClipboardAndReport(): Promise<void> {
   })
 }
 
+// ─── Sair ─────────────────────────────────────────────────────────────────────
+
+/** "Sair" só sai depois de o lojista confirmar que os pedidos vão parar. */
+async function confirmAndQuit(): Promise<void> {
+  const confirmation = buildQuitConfirmation({
+    configured: isConfigured(),
+    queueLength: getQueueStatus().length,
+  })
+
+  if (confirmation === null) {
+    app.quit()
+    return
+  }
+
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    title: 'Zuppy Impressora',
+    message: confirmation.message,
+    detail: confirmation.detail,
+    buttons: [...confirmation.buttons],
+    defaultId: confirmation.defaultId,
+    cancelId: confirmation.cancelId,
+    noLink: true,
+  })
+
+  if (response === confirmation.quitButtonIndex) {
+    log.info('Saída confirmada pelo lojista na bandeja')
+    app.quit()
+  }
+}
+
 // ─── Menu de contexto ──────────────────────────────────────────────────────────
 
 /** Título do menu: com profile, diz QUAL instância é esta. */
@@ -123,7 +156,10 @@ function buildContextMenu(): Menu {
     {
       label: 'Sair',
       click: () => {
-        app.quit()
+        confirmAndQuit().catch((err) => {
+          // Na dúvida o app continua imprimindo: sair é a ação que custa pedido.
+          log.error('Confirmação do Sair falhou', err)
+        })
       },
     },
   ])
