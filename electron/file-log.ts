@@ -23,6 +23,11 @@ export const LOG_MAX_BYTES = 5 * 1024 * 1024
 export const LOG_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const PRUNE_EVERY_MS = 60 * 60 * 1000
 
+/** Teto de vazão por janela de 1 min: 5 linhas iguais e 300 no total. */
+export const THROTTLE_WINDOW_MS = 60_000
+export const THROTTLE_PER_KEY_MAX = 5
+export const THROTTLE_GLOBAL_MAX = 300
+
 const TIMESTAMP = /^\[(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\]/
 
 export interface FileLogOptions {
@@ -128,14 +133,63 @@ export function createFileLog(options: FileLogOptions) {
     try {
       fs.rmSync(previousPath, { force: true })
       fs.renameSync(activePath, previousPath)
+      activeSize = 0
     } catch {
+      // Arquivo preso (antivírus, indexador): copia e esvazia no lugar. Nunca
+      // apaga o ativo sem ter guardado o anterior.
       try {
-        fs.rmSync(activePath, { force: true })
+        fs.copyFileSync(activePath, previousPath)
+        fs.writeFileSync(activePath, '', 'utf8')
+        activeSize = 0
       } catch {
         // sem como liberar espaço: o próximo append tenta de novo
       }
     }
-    activeSize = 0
+  }
+
+  // ── Teto de vazão: um site qualquer não pode inundar o arquivo e empurrar as
+  // últimas 24 h para fora (cada requisição barrada pelo CORS vira linhas).
+  let windowStartedAt = now()
+  let globalCount = 0
+  let suppressed = 0
+  const perKey = new Map<string, number>()
+
+  /** Chave da linha sem o carimbo: o que se repete, repete igual. */
+  function throttleKey(line: string): string {
+    return line.replace(TIMESTAMP, '').slice(0, 80)
+  }
+
+  function writeRaw(line: string): void {
+    const body = line + '\n'
+    const bytes = Buffer.byteLength(body)
+    if (activeSize + bytes > maxBytes / 2) rotate()
+    fs.appendFileSync(activePath, body, 'utf8')
+    activeSize += bytes
+  }
+
+  /** Dentro do teto desta janela de 1 min? Ao virar a janela, registra quantas ficaram de fora. */
+  function admit(line: string, nowMs: number): boolean {
+    if (nowMs - windowStartedAt >= THROTTLE_WINDOW_MS) {
+      if (suppressed > 0) {
+        writeRaw(
+          `[${new Date(nowMs).toISOString()}] [WARN] [LOG] ${suppressed} linha(s) repetida(s) omitida(s) no último minuto`,
+        )
+      }
+      windowStartedAt = nowMs
+      globalCount = 0
+      suppressed = 0
+      perKey.clear()
+    }
+
+    const key = throttleKey(line)
+    const seen = perKey.get(key) ?? 0
+    if (seen >= THROTTLE_PER_KEY_MAX || globalCount >= THROTTLE_GLOBAL_MAX) {
+      suppressed++
+      return false
+    }
+    perKey.set(key, seen + 1)
+    globalCount++
+    return true
   }
 
   function append(line: string): void {
@@ -143,6 +197,7 @@ export function createFileLog(options: FileLogOptions) {
       if (!ensureDir()) return
       const nowMs = now()
       if (nowMs - lastPruneAt >= PRUNE_EVERY_MS) prune()
+      if (!admit(line, nowMs)) return
 
       const body = line + '\n'
       const bytes = Buffer.byteLength(body)

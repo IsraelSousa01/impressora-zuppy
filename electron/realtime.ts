@@ -680,10 +680,15 @@ function reportUpdateSafeWindowSignals(): void {
     // Quem segura o sono do computador (electron/sleep-guard.ts) ouve isto.
     // A conjunção de isStoreClosedForUpdate nunca declara "fechada" a mais que
     // o servidor: na dúvida o computador fica acordado.
-    realtimeEvents.emit('poll-ok', {
-      storeClosed,
-      hasSession: Boolean(getConfig().session_token),
-    })
+    // Em try próprio: um ouvinte com defeito não pode pular a janela segura.
+    try {
+      realtimeEvents.emit('poll-ok', {
+        storeClosed,
+        hasSession: Boolean(getConfig().session_token),
+      })
+    } catch (err) {
+      log.error('Ouvinte de poll-ok (ignorado):', err instanceof Error ? err.message : String(err))
+    }
     maybeInstallOnSafeWindow({
       storeClosed,
       queueEmpty: getQueueStatus().length === 0,
@@ -875,6 +880,9 @@ export async function disconnect(): Promise<void> {
   }
   pendingOutOfPace = null
   wake.reset('polling parado')
+  // Parada deliberada (≠ 'disconnected', que também é queda de rede): quem
+  // segura recursos por causa da sessão (sleep-guard) solta aqui.
+  realtimeEvents.emit('stopped')
 
   if (isCurrentlyConnected) {
     isCurrentlyConnected = false

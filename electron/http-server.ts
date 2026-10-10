@@ -677,7 +677,9 @@ function buildExpressApp(port: number): express.Express {
 
   // Generic error handler
   expressApp.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-    log.error('Unhandled HTTP error', err)
+    // Só a mensagem: o objeto de erro do body-parser carrega o corpo recebido
+    // (`body`), e o corpo de um /print-raw é uma comanda.
+    log.error('Unhandled HTTP error', err.message)
     res.status(500).json({ error: err.message })
   })
 

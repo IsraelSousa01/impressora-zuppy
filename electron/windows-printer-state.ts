@@ -123,6 +123,7 @@ export function parsePrinterStateOutput(stdout: string): ParsedPrinterState | nu
  */
 const PRINTER_STATE_SCRIPT =
   "$n = $env:ZUPPY_PRINTER_NAME; " +
+  "$ErrorActionPreference = 'Stop'; " +
   "$p = Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Name -eq $n } | Select-Object -First 1; " +
   "if ($null -eq $p) { '{\"Found\":false}' } else { " +
   "$prefix = $n + ','; " +

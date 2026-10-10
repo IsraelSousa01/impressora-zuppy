@@ -692,6 +692,33 @@ describe('polling com o sinal de acordar (1.5.0)', () => {
       o.parar()
     })
 
+    it("disconnect() emite 'stopped' (parada deliberada); queda de rede não", async () => {
+      const parou: number[] = []
+      const ouvinte = () => parou.push(1)
+      realtimeEvents.on('stopped', ouvinte)
+      await connect()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(parou).toHaveLength(0)
+      await disconnect()
+      expect(parou).toHaveLength(1)
+      realtimeEvents.off('stopped', ouvinte)
+    })
+
+    it('ouvinte de poll-ok que lança não impede o polling nem a janela segura', async () => {
+      const ruim = () => {
+        throw new Error('ouvinte com defeito')
+      }
+      realtimeEvents.on('poll-ok', ruim)
+      corpoDoPoll = () => ({ jobs: [], next_poll_ms: 30000, store_closed: true })
+      await connect()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(_getUpdateStoreClosedForTests()).toBe(true)
+      const antes = polls().length
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(polls().length).toBeGreaterThan(antes)
+      realtimeEvents.off('poll-ok', ruim)
+    })
+
     it('consulta que falha (500) não emite: sem sinal novo o bloqueio expira sozinho', async () => {
       const o = ouvirPollOk()
       statusDoPoll = 500

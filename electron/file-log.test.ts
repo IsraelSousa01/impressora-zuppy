@@ -9,7 +9,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createFileLog, LOG_MAX_BYTES, LOG_MAX_AGE_MS } from './file-log'
+import {
+  createFileLog,
+  LOG_MAX_BYTES,
+  LOG_MAX_AGE_MS,
+  THROTTLE_WINDOW_MS,
+  THROTTLE_PER_KEY_MAX,
+  THROTTLE_GLOBAL_MAX,
+} from './file-log'
 
 const T0 = Date.parse('2026-10-10T12:00:00.000Z')
 let dir: string
@@ -109,5 +116,39 @@ describe('createFileLog', () => {
     log.append(line(T0, 'x'))
     expect(fs.readdirSync(dir).every((f) => !f.includes('..'))).toBe(true)
     expect(fs.existsSync(path.join(dir, '..', 'fora.log'))).toBe(false)
+  })
+})
+
+describe('teto de vazão (site que inunda o log)', () => {
+  it('linha idêntica repetida: só as primeiras entram, e a janela seguinte registra quantas ficaram de fora', () => {
+    let now = T0
+    const log = createFileLog({ dir, baseName: 'app', now: () => now })
+
+    for (let i = 0; i < 2000; i++) log.append(line(now, 'CORS blocked origin: https://evil.test'))
+    const raw1 = fs.readFileSync(path.join(dir, 'app.log'), 'utf8')
+    expect(raw1.split('\n').filter(Boolean)).toHaveLength(THROTTLE_PER_KEY_MAX)
+
+    now += THROTTLE_WINDOW_MS + 1
+    log.append(line(now, 'segue funcionando'))
+    const raw2 = fs.readFileSync(path.join(dir, 'app.log'), 'utf8')
+    expect(raw2).toMatch(/1995 linha\(s\) repetida\(s\) omitida\(s\)/)
+    expect(raw2).toContain('segue funcionando')
+  })
+
+  it('linhas diferentes legítimas passam; o total por minuto tem teto', () => {
+    const now = T0
+    const log = createFileLog({ dir, baseName: 'app', now: () => now })
+    for (let i = 0; i < THROTTLE_GLOBAL_MAX + 100; i++) log.append(line(now, `origem-${i}`))
+    const lines = fs.readFileSync(path.join(dir, 'app.log'), 'utf8').split('\n').filter(Boolean)
+    expect(lines).toHaveLength(THROTTLE_GLOBAL_MAX)
+  })
+
+  it('o inundador não expulsa o que já estava no arquivo', () => {
+    let now = T0
+    const log = createFileLog({ dir, baseName: 'app', now: () => now })
+    log.append(line(now, 'Job importante concluído'))
+    for (let i = 0; i < 5000; i++) log.append(line(now, `CORS blocked origin: https://x${i % 3}.test`))
+    now += 1000
+    expect(log.readRecent({ maxLines: 50 }).lines.some((l) => l.includes('Job importante'))).toBe(true)
   })
 })

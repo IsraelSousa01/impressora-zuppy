@@ -20,7 +20,7 @@ import fs from 'fs'
 import { getConfig, isConfigured, getLogs, setConfig } from './store'
 import { loadPendingQueue } from './store'
 import { startHttpServer, stopHttpServer, getBoundPort } from './http-server'
-import { connect, disconnect, realtimeEvents } from './realtime'
+import { connect, disconnect, realtimeEvents, getConnectionStatus } from './realtime'
 import { createSleepGuard } from './sleep-guard'
 import { restoreQueue, getQueueStatus } from './print-queue'
 import { registerDownloadedUpdate } from './updater'
@@ -256,8 +256,11 @@ function setupSleepGuard(): void {
       )
     }
   })
-  // Pareamento trocado / app parado: nada de segurar o computador sem sessão.
-  realtimeEvents.on('disconnected', () => sleepGuard.release())
+  // Polling PARADO de propósito (pareamento trocado, app saindo): nada de
+  // segurar o computador sem sessão. Queda de internet NÃO solta aqui — é
+  // justamente quando o computador não pode dormir com a loja aberta; um sinal
+  // velho expira sozinho (SLEEP_GUARD_STALE_MS).
+  realtimeEvents.on('stopped', () => sleepGuard.release())
 }
 
 // ─── Atalho que o navegador chama ──────────────────────────────────────────────
@@ -317,9 +320,11 @@ function handleUncaughtException(err: unknown): void {
     return
   }
 
-  markCleanExit(userData)
+  // O marcador de execução FICA: o próximo boot registra que a anterior caiu.
   // O link do navegador não é argumento a repetir na reabertura.
   const args = process.argv.slice(1).filter((a) => !a.toLowerCase().startsWith(`${PROTOCOL_SCHEME}:`))
+  // O novo processo precisa do lock; o Electron o inicia só depois deste sair.
+  app.releaseSingleInstanceLock()
   app.relaunch({ args })
   app.exit(1)
 }
@@ -331,6 +336,10 @@ process.on('unhandledRejection', (reason) => {
 })
 
 app.on('before-quit', async () => {
+  // A segunda cópia (sem o lock) também passa por aqui ao sair: ela não é dona
+  // do marcador, do servidor local nem do polling da primeira.
+  if (!gotLock) return
+
   log.info('App quitting…')
   markCleanExit(app.getPath('userData'))
   sleepGuard.release()
@@ -393,5 +402,30 @@ app.whenReady().then(async () => {
   // Atalho do navegador
   registerProtocolClient()
   // Aberto PELO link (app ainda fechado): o lojista espera uma resposta.
-  if (gotLock && shouldShowNoticeOnBoot(process.argv)) showOpenNotice()
+  if (gotLock && shouldShowNoticeOnBoot(process.argv)) showOpenNoticeWhenKnown()
 })
+
+/**
+ * Recém-aberto, o app ainda não consultou o servidor: mostrar a janelinha agora
+ * diria "sem conexão" por engano. Espera a primeira conexão (no máx. 8 s); sem
+ * pareamento não há o que esperar.
+ */
+const OPEN_NOTICE_WAIT_MS = 8_000
+
+function showOpenNoticeWhenKnown(): void {
+  if (!isConfigured() || getConnectionStatus()) {
+    showOpenNotice()
+    return
+  }
+
+  let shown = false
+  const show = (): void => {
+    if (shown) return
+    shown = true
+    clearTimeout(timer)
+    realtimeEvents.off('connected', show)
+    showOpenNotice()
+  }
+  const timer = setTimeout(show, OPEN_NOTICE_WAIT_MS)
+  realtimeEvents.on('connected', show)
+}

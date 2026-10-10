@@ -90,3 +90,57 @@ describe('scrubLogLine — forma da linha', () => {
     expect(scrubLogLine(line)).toBe(line)
   })
 })
+
+describe('scrubLogLine — achados da revisão', () => {
+  it('é linear: entrada patológica de 64 KB termina em milissegundos', () => {
+    const inputs = [
+      'a.'.repeat(32_000),
+      'token'.repeat(13_000),
+      'a-b'.repeat(22_000) + '=',
+      '"' + 'k'.repeat(60_000),
+    ]
+    for (const input of inputs) {
+      const start = performance.now()
+      scrubLogLine(input)
+      expect(performance.now() - start).toBeLessThan(250)
+    }
+  })
+
+  it('JSON escapado dentro de uma string de log (meta string)', () => {
+    const line = 'Authentication failed: "{\\"customer_name\\":\\"Joao Silva\\",\\"ok\\":true}"'
+    const out = scrubLogLine(line)
+    expect(out).not.toContain('Joao')
+    expect(out).not.toContain('Silva')
+  })
+
+  it('formato chave: valor em texto livre', () => {
+    const out = scrubLogLine('falhou: cliente: Joao Silva, endereco: Rua X 10, status: 500')
+    expect(out).not.toContain('Joao')
+    expect(out).not.toContain('Rua X')
+    expect(out).toContain('status: 500')
+  })
+
+  it('Authorization: Basic e CEP com hífen', () => {
+    const out = scrubLogLine('Authorization: Basic dXNlcjpwYXNz e CEP 01310-100 invalido')
+    expect(out).not.toContain('dXNlcjpwYXNz')
+    expect(out).not.toContain('01310-100')
+  })
+
+  it('o corte não deixa pedaço de token na ponta', () => {
+    const token = 'tok_' + 'a1B2c3D4'.repeat(8)
+    const line = 'x '.repeat(996) + token
+    const out = scrubLogLine(line)
+    expect(out).not.toContain('a1B2c3D4')
+    expect(out.length).toBeLessThanOrEqual(MAX_LOG_LINE_LENGTH + 20)
+  })
+
+  it('grupo de UUID só de dígitos não vira telefone', () => {
+    const uuid = '12345678-1234-1234-1234-123456789012'
+    expect(scrubLogLine(`Job ${uuid} ok`)).toContain(uuid)
+  })
+
+  it('chaves comuns não sensíveis continuam legíveis', () => {
+    const line = '{"order_number":"1234","printer_name":"EPSON TM-T20","status":"failed","filename":"a.log"}'
+    expect(scrubLogLine(line)).toBe(line)
+  })
+})
