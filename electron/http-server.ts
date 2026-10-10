@@ -41,8 +41,12 @@ import {
 import { createLogger, maskDeviceToken, readRecentLog } from './logger'
 import { formatDeviceLabel } from './destination'
 import { DEFAULT_LOCAL_PORT } from './instance'
+import { createPrinterStateMonitor } from './windows-printer-state'
 
 const log = createLogger('HTTP')
+
+/** Estado da impressora lido do Windows (em cache; ver electron/windows-printer-state.ts). */
+const printerStateMonitor = createPrinterStateMonitor()
 
 /**
  * Porta histórica. Continua sendo a da instância default — quem abre o app sem
@@ -438,6 +442,10 @@ function buildRouter(port: number) {
       // O Gestor usa isto pra saber se o app está apontado pro ambiente dele.
       api_url: cfg.api_url ?? null,
       connected: getConnectionStatus(),
+      // ADITIVO (1.6.0): estado da impressora segundo o Windows — offline, sem
+      // papel, parada... `null` = sem impressora escolhida ou ainda não lido.
+      // Em cache de 30 s e sem bloquear: a resposta nunca espera o PowerShell.
+      printer_state: printerStateMonitor.get(cfg.printer_name),
       // Update baixado aguardando janela segura (loja fechada + fila vazia).
       // `downloadedAt` deixa o painel detectar "esperando há muito tempo" e
       // oferecer o botão de instalar agora (POST /install-update).

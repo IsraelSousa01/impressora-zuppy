@@ -294,6 +294,17 @@ describe('identidade do app nas respostas', () => {
     expect(payload.paper_size).toBe('58mm')
   })
 
+  it('GET /status: printer_state é campo aditivo e fica null sem impressora escolhida', async () => {
+    const porta = PORTA_BASE + 49
+    await startHttpServer([porta])
+
+    const { body } = await get(porta, '/status')
+    const payload = JSON.parse(body) as Record<string, unknown>
+
+    expect(payload).toHaveProperty('printer_state')
+    expect(payload.printer_state).toBeNull()
+  })
+
   it('paper_size fora dos dois valores conhecidos não vaza para o /status', async () => {
     const porta = PORTA_BASE + 44
     // Valor que só um /configure antigo (ou adulterado) gravaria: o app
