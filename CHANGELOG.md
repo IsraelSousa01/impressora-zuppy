@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.6.0 (em desenvolvimento) — o app se explica e se protege
+
+Melhorias que não dependem do servidor. Nenhum contrato existente mudou (`/ping`, `/status`, `/configure`, `/printers`, `/test-print`, `/print-raw`, `/install-update`): só campos e rotas novos, todos opcionais para quem chama.
+
+- **Janelinha "Zuppy Impressora está aberto e imprimindo"** ao abrir o atalho com o app já aberto. Só diz "imprimindo" quando é verdade (pareado, com impressora e conectado); sem conexão ou sem pareamento, diz isso.
+- **Atalho `zuppy-impressora://abrir`** (Windows) que o navegador chama. A URL só abre a janelinha: parâmetros, caminho e fragmento são ignorados; qualquer outro destino não faz nada. Registrado só no app instalado e na instância padrão.
+- **"Sair" na bandeja pede confirmação** dizendo que os pedidos deixam de imprimir (e quantas comandas estão na fila). O botão padrão é "Continuar imprimindo". A atualização automática e o desligamento do Windows não pedem confirmação.
+- **Reabre sozinho depois de um erro inesperado** do processo principal (no máximo 3 vezes em 10 min; acima disso o app segue rodando). O log registra quando a execução anterior não terminou normalmente. Queda dura (encerrar pelo Gerenciador de Tarefas, falta de energia) continua dependendo do auto-start do Windows no próximo login: nenhum código do processo cobre isso.
+- **Computador acordado com a loja aberta** (`powerSaveBlocker`, `prevent-app-suspension`). Só com loja aberta e sessão ativa; solta ao fechar, ao perder a sessão, ao parar o polling e sozinho depois de 5 min sem consulta. A tela continua apagando. Consumo: o de um computador ligado e ocioso; em notebook na bateria a carga dura menos com a loja aberta.
+- **Registro em arquivo** em `<logs do app>/zuppy-impressora[-profile].log`, rotativo (total ≤ 5 MB, ~24 h). Passa por um filtro que remove token, Bearer, nome, telefone, endereço, e-mail e documento. `debug` fica só no console. Teto de vazão (5 linhas iguais e 300 por minuto, com um resumo do que foi omitido): um site que fique chamando o servidor local não empurra o diagnóstico para fora do arquivo.
+- **`GET /logs`** devolve o trecho recente (até 500 linhas) **só** a uma página do Zuppy (header `Origin` na allowlist; sem `Origin` é 403, ao contrário do `/status`). Sem upload automático.
+- **`printer_state` no `/status`**: estado da impressora lido do Windows (`ok`, `offline`, `paper_out`, `paper_jam`, `door_open`, `stopped`, `error`, `not_found`, `unknown`) com a fila do spooler. Em cache de 30 s; o `/status` nunca espera o Windows.
+
 ## 1.5.1 — papel escolhido no painel
 
 - **O papel da impressora (58mm ou 80mm) pode ser trocado pelo painel do Zuppy**, inclusive em sessão de suporte, sem ninguém no computador da loja. O servidor manda a escolha no poll (`printer_paper_size: { value, set_at }`), e o app troca o papel, descarta a calibração da impressora anterior e refaz o handshake uma vez para o servidor montar a comanda na largura nova.

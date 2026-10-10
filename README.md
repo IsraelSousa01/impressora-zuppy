@@ -138,6 +138,7 @@ origem, então o destino continua o do último pareamento.
 | POST   | `/configure`   | Pareia o app (tenant, device_token, api_url) |
 | GET    | `/printers`    | Lista impressoras instaladas → `{ printers, error }` |
 | POST   | `/test-print`  | Imprime página de teste                |
+| GET    | `/logs`        | Trecho recente do registro em arquivo (só página do Zuppy; ver *Registro em arquivo*) |
 
 ### Como o Zuppy reconhece este app
 
@@ -209,6 +210,7 @@ Só `device_token` é obrigatório (string não vazia; sem ele, `400`). Os demai
   "display_name": "Cozinha — Podrão",
   "api_url": null,
   "connected": true,
+  "printer_state": { "status": "ok", "queued_jobs": 0, "checked_at": "2026-10-10T12:00:00.000Z" },
   "update": { "updateReady": false, "version": null, "downloadedAt": null }
 }
 ```
@@ -228,6 +230,13 @@ Só `device_token` é obrigatório (string não vazia; sem ele, `400`). Os demai
   legado da loja.
 - `display_name` — "Cozinha — Podrão". `tenant_name` continua significando a
   **loja**.
+- `printer_state` — **aditivo (1.6.0)**: o que o Windows diz da impressora
+  escolhida. `status` é `ok`, `offline`, `paper_out`, `paper_jam`, `door_open`,
+  `stopped`, `error`, `not_found` ou `unknown`; `queued_jobs` é a fila do
+  spooler (`null` = não deu para contar). `null` quando não há impressora
+  escolhida ou a primeira leitura ainda não terminou. Em cache de 30 s: o
+  `/status` nunca espera o Windows, e sem ninguém perguntando nenhum processo
+  roda. Quem não conhece o campo o ignora.
 
 ## Configuração de Ícone
 
@@ -246,6 +255,18 @@ Configure `electron-builder.yml` com seu repositório GitHub e crie releases nor
 O update baixado só é instalado sozinho na "janela segura": loja fechada por horário, fila de impressão vazia e quieta há 60 s. "Loja fechada" vem do `next_poll_ms` do servidor (30 s = fechada) e, desde a 1.5.0, também do `store_closed` quando o servidor o manda (os dois precisam concordar). O ritmo que o próprio app escolhe com o sinal de acordar (30 s) nunca conta.
 
 Lançamento gradual: o `latest.yml` aceita `stagingPercentage: <0-100>`; cada instalação sorteia um número fixo e só atualiza se ele cair dentro do percentual. Para ampliar, edite o `latest.yml` da release (subir o percentual) ou remova a linha. Publique o `latest.yml` **por último**, depois do `.exe` e do `.blockmap`.
+
+## Abrir o app, sair e dormir (1.6.0)
+
+- **Atalho do navegador**: o instalador registra `zuppy-impressora://abrir`. A URL só abre a janelinha "está aberto"; query, caminho e fragmento são ignorados (`electron/launch.ts`). Clicar no atalho do app com ele já aberto mostra a mesma janelinha.
+- **Sair** na bandeja pede confirmação (`electron/quit-guard.ts`). O app reabre sozinho depois de um erro inesperado do processo principal, com teto de 3 reaberturas em 10 min (`electron/run-state.ts`). O que reabre depois de queda dura é o auto-start do Windows (próximo login) e, depois de atualizar, o instalador.
+- **Computador acordado**: `powerSaveBlocker` (`prevent-app-suspension`) enquanto a loja está aberta e há sessão (`electron/sleep-guard.ts`, sinal `store_closed` + ritmo do servidor, o mesmo da janela segura de atualização). Expira sozinho em 5 min sem consulta. A tela continua apagando.
+
+## Registro em arquivo (1.6.0)
+
+O console do app instalado se perde; o `logger` agora também grava em `app.getPath('logs')` (`zuppy-impressora.log`, ou `zuppy-impressora-<profile>.log`). Rotação por tamanho (`.1.log` = o anterior; total ≤ 5 MB) e poda de 24 h (`electron/file-log.ts`). Toda linha passa por `electron/log-scrub.ts` antes de ir ao arquivo: token/Bearer/JWT, chaves de nome, telefone, endereço, e-mail e documento, telefone e e-mail soltos e sequências opacas são trocados por `[redigido]`.
+
+`GET /logs[?lines=N]` (N ≤ 500) devolve `{ zuppy_printer_app, window_hours, truncated, lines }`. É a rota mais fechada do servidor: exige `Origin` da allowlist do Zuppy (sem `Origin` ou fora da allowlist é negado; `localhost` só fora do app empacotado). Não há upload automático: o arquivo só sai daqui quando o diagnóstico do Zuppy pede.
 
 ## Papel escolhido no painel (1.5.1)
 
